@@ -4,6 +4,7 @@
 
 use crate::error::{PluginError, Result};
 use serde::Deserialize;
+use std::net::SocketAddr;
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,6 +147,14 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        // server.bind must parse here so `check` can fail fast on typos
+        // (e.g. `127.0.0.1:abc`) instead of surfacing them only at `run`.
+        self.server.bind.parse::<SocketAddr>().map_err(|e| {
+            PluginError::Config(format!(
+                "server.bind '{}' is not a valid SocketAddr: {e}",
+                self.server.bind
+            ))
+        })?;
         if self.wechat.token.is_empty() || self.wechat.token == "REPLACE_ME" {
             return Err(PluginError::Config(
                 "wechat.token must be set (see 公众平台 → 基本配置)".into(),
@@ -230,6 +239,25 @@ encrypt_mode = "safe"
         );
         let err = Config::from_path(f.path()).await.unwrap_err();
         assert!(matches!(err, PluginError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn malformed_bind_rejected_at_validate_time() {
+        // Critical: `check` MUST catch this so the user doesn't deploy a
+        // broken config to production and discover it only at `run`.
+        let f = write_tmp(
+            r#"
+[server]
+bind = "127.0.0.1:not-a-port"
+[wechat]
+token = "abc"
+app_id = "wx123"
+"#,
+        );
+        let err = Config::from_path(f.path()).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("SocketAddr"), "{msg}");
+        assert!(msg.contains("not-a-port"), "{msg}");
     }
 
     #[tokio::test]
