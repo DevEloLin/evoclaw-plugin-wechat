@@ -1,15 +1,29 @@
 //! Axum webhook handler for WeChat Official Account messages.
 //!
-//! Two routes are mounted at `config.server.endpoint_path`:
+//! Two routes mount at `config.server.endpoint_path`:
 //!
 //! * `GET ?signature&timestamp&nonce&echostr`  — one-time URL verification
-//!   when the user clicks "提交" in 公众平台 → 基本配置. The server
-//!   returns `echostr` verbatim iff the signature checks out.
+//!   when the user clicks "提交" in 公众平台 → 基本配置. Returns
+//!   `echostr` verbatim iff the signature checks out.
 //!
 //! * `POST ?signature&timestamp&nonce[&msg_signature&encrypt_type]`  —
 //!   one inbound message. The body is XML. Plain mode reads it directly;
 //!   compatible / safe modes verify `msg_signature` and AES-decrypt the
 //!   `<Encrypt>` element first.
+//!
+//! Hardening (see `bridge.rs` for the subprocess-side counterparts):
+//!
+//! * **Replay protection** — every accepted request's timestamp must lie
+//!   within ±300s of the server clock, and its nonce must not have been
+//!   seen in the last 300s. Caches are pruned on every insert.
+//!
+//! * **Retry idempotency** — text messages are keyed by `msg_id` into a
+//!   60s reply cache. WeChat retries (same `msg_id`) reuse the cached
+//!   reply instead of re-invoking the LLM.
+//!
+//! * **Length cap** — outbound text is truncated to `reply.max_chars`
+//!   chars before being wrapped in CDATA, keeping the XML envelope under
+//!   WeChat's ~2048-byte limit for the `<Content>` element.
 
 use crate::bridge::BridgePool;
 use crate::config::{Config, EncryptMode};
@@ -19,8 +33,27 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
+/// How long a reply stays in the dedup cache. WeChat retries within
+/// seconds of the first attempt, so 60s is generous.
+const REPLY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Replay-protection window for the WeChat-supplied `timestamp` query
+/// param. Requests outside `[now - REPLAY_WINDOW, now + REPLAY_WINDOW]`
+/// are rejected. Same window doubles as the TTL for the nonce cache.
+const REPLAY_WINDOW_SECS: i64 = 300;
+
+#[derive(Clone)]
+struct CacheEntry {
+    inserted_at: Instant,
+    reply_text: String,
+}
+
+type ReplyCache = Arc<StdMutex<HashMap<String, CacheEntry>>>;
+type NonceCache = Arc<StdMutex<HashMap<String, Instant>>>;
 
 /// Shared state injected into both routes by axum.
 #[derive(Clone)]
@@ -29,6 +62,23 @@ pub struct HandlerState {
     pub pool: Arc<BridgePool>,
     /// AES-256 key, pre-decoded once at startup. `None` for plain mode.
     pub aes_key: Option<Arc<[u8; 32]>>,
+    /// Per-`msg_id` reply cache so WeChat retries don't trigger a fresh
+    /// LLM call. Created in `new_state()` (not by the caller).
+    reply_cache: ReplyCache,
+    /// Recently-seen nonces. Used to reject replays of signed requests.
+    nonce_cache: NonceCache,
+}
+
+impl HandlerState {
+    pub fn new(cfg: Arc<Config>, pool: Arc<BridgePool>, aes_key: Option<Arc<[u8; 32]>>) -> Self {
+        Self {
+            cfg,
+            pool,
+            aes_key,
+            reply_cache: Arc::new(StdMutex::new(HashMap::new())),
+            nonce_cache: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -43,8 +93,7 @@ pub struct WebhookQuery {
     _encrypt_type: Option<String>,
 }
 
-/// One-time URL verification. WeChat hits this with `echostr`; we echo it
-/// back iff `sha1(sort([token,ts,nonce]))` matches the supplied signature.
+/// One-time URL verification.
 pub async fn verify_url(
     State(state): State<HandlerState>,
     Query(q): Query<WebhookQuery>,
@@ -67,8 +116,7 @@ pub async fn verify_url(
     (StatusCode::OK, echo).into_response()
 }
 
-/// Inbound message. Returns the passive-reply XML body (or empty string
-/// to ack-without-reply, which WeChat treats as silent success).
+/// Inbound message.
 pub async fn handle_message(
     State(state): State<HandlerState>,
     Query(q): Query<WebhookQuery>,
@@ -76,12 +124,18 @@ pub async fn handle_message(
 ) -> Response {
     let cfg = &*state.cfg;
 
-    // 1) Verify signature. Encrypted modes use msg_signature; plain uses signature.
     let (Some(ts), Some(nonce)) = (q.timestamp.as_deref(), q.nonce.as_deref()) else {
         return (StatusCode::BAD_REQUEST, "missing timestamp/nonce").into_response();
     };
 
-    // 2) Decode body — handle plain vs encrypted.
+    // Replay protection runs BEFORE signature verify so an attacker
+    // replaying a valid signed envelope still gets shut down.
+    if let Err(why) = check_replay(&state, ts, nonce) {
+        tracing::warn!(reason = why, "replay protection rejected request");
+        return (StatusCode::FORBIDDEN, "replay rejected").into_response();
+    }
+
+    // Decode body — plain vs encrypted.
     let (decoded_xml, is_encrypted) = match cfg.wechat.encrypt_mode {
         EncryptMode::Plain => {
             let Some(sig) = q.signature.as_deref() else {
@@ -98,18 +152,15 @@ pub async fn handle_message(
             let encrypt = match extract_encrypt_element(&body) {
                 Ok(s) => s,
                 Err(e) => {
-                    // In compatible mode WeChat may legitimately send plain
-                    // payloads alongside encrypted ones. Try plain verify.
+                    // Compatible mode may legitimately receive plain
+                    // payloads alongside encrypted ones; try plain verify.
                     if cfg.wechat.encrypt_mode == EncryptMode::Compatible {
                         if let Some(sig) = q.signature.as_deref() {
                             let expected =
                                 signature::plain_signature(&cfg.wechat.token, ts, nonce);
                             if signature::verify(&expected, sig) {
                                 tracing::debug!("compatible mode: falling back to plain");
-                                return dispatch_and_reply(
-                                    &state, body, /*is_encrypted=*/ false,
-                                )
-                                .await;
+                                return dispatch_and_reply(&state, body, false).await;
                             }
                         }
                     }
@@ -146,7 +197,8 @@ pub async fn handle_message(
 }
 
 /// Parse the decoded XML, route by message type, render an outbound XML
-/// reply, optionally re-encrypt it.
+/// reply, optionally re-encrypt it. This is also where the `msg_id` reply
+/// cache is consulted so WeChat retries don't re-trigger the LLM.
 async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: bool) -> Response {
     let inbound = match wxml::parse_inbound(&xml) {
         Ok(m) => m,
@@ -160,30 +212,52 @@ async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: boo
     let to = inbound.to_user_name.clone();
     let cfg = &*state.cfg;
 
-    // Decide reply text.
     let reply_text: Option<String> = match inbound.msg_type.as_str() {
         "text" => {
             let user_msg = inbound.content.clone().unwrap_or_default();
             if user_msg.trim().is_empty() {
                 None
             } else {
-                Some(ask_with_timeout(state, &from, &user_msg).await)
+                // msg_id dedup: WeChat retries within 5s/15s using the same
+                // MsgId. Without this cache, a slow LLM that misses the
+                // first deadline would be triggered AGAIN by the retry
+                // (and again by the next retry) — wasting tokens and
+                // potentially returning out-of-order results.
+                let msg_id = inbound.msg_id.as_deref().unwrap_or("");
+                if !msg_id.is_empty() {
+                    if let Some(cached) = lookup_cached_reply(&state.reply_cache, msg_id) {
+                        tracing::info!(msg_id, "returning cached reply (WeChat retry)");
+                        Some(cached)
+                    } else {
+                        let answer = ask_with_timeout(state, &from, &user_msg).await;
+                        let capped = cap_reply_text(&answer, cfg.reply.max_chars);
+                        store_reply(&state.reply_cache, msg_id, capped.clone());
+                        Some(capped)
+                    }
+                } else {
+                    // No MsgId (shouldn't happen for text, but defensive).
+                    let answer = ask_with_timeout(state, &from, &user_msg).await;
+                    Some(cap_reply_text(&answer, cfg.reply.max_chars))
+                }
             }
         }
         "event" => match inbound.event.as_deref().unwrap_or("") {
-            "subscribe" if !cfg.reply.welcome.is_empty() => Some(cfg.reply.welcome.clone()),
-            _ if cfg.reply.echo_unknown_event => Some(cfg.reply.fallback.clone()),
+            "subscribe" if !cfg.reply.welcome.is_empty() => {
+                Some(cap_reply_text(&cfg.reply.welcome, cfg.reply.max_chars))
+            }
+            _ if cfg.reply.echo_unknown_event => {
+                Some(cap_reply_text(&cfg.reply.fallback, cfg.reply.max_chars))
+            }
             _ => None,
         },
         _ => {
-            // Non-text non-event (image/voice/video/...) — ack silently for
-            // now. Users wanting auto-reply to media can extend this branch.
+            // Non-text non-event (image/voice/video/...) — ack silently
+            // for now. Extend this branch to support media auto-reply.
             None
         }
     };
 
     let Some(reply) = reply_text else {
-        // Ack with empty body — WeChat treats this as "received, no reply".
         return (StatusCode::OK, "").into_response();
     };
 
@@ -192,8 +266,7 @@ async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: boo
         match wrap_encrypted_envelope(state, &plain_xml) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(error = %e, "outbound encrypt failed");
-                // Fall back to plain — better than no reply at all.
+                tracing::warn!(error = %e, "outbound encrypt failed; falling back to plain");
                 plain_xml
             }
         }
@@ -209,11 +282,19 @@ async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: boo
         .into_response()
 }
 
-/// Call the bridge with a hard timeout. On timeout or backend failure,
-/// return the configured fallback string so the user always sees a reply.
+/// Call the bridge with a hard timeout. On timeout, backend failure, or
+/// "no live bridges" from the pool, return the configured fallback.
 async fn ask_with_timeout(state: &HandlerState, openid: &str, text: &str) -> String {
     let timeout = Duration::from_millis(state.cfg.evoclaw.timeout_ms);
-    let bridge = state.pool.checkout();
+    // Checkout itself can fail (every slot dead + respawn failures); fall
+    // back gracefully instead of returning 500 to WeChat.
+    let bridge = match state.pool.checkout().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "bridge checkout failed, using fallback");
+            return state.cfg.reply.fallback.clone();
+        }
+    };
     match tokio::time::timeout(timeout, bridge.ask(openid, text)).await {
         Ok(Ok(reply)) if !reply.trim().is_empty() => reply,
         Ok(Ok(_)) => {
@@ -231,9 +312,80 @@ async fn ask_with_timeout(state: &HandlerState, openid: &str, text: &str) -> Str
     }
 }
 
-/// Naive `<Encrypt>...</Encrypt>` extractor. Avoids pulling in a second XML
-/// parse pass — the body is small and the tag is unambiguous.
-fn extract_encrypt_element(xml: &str) -> Result<String, &'static str> {
+// ---------------------------------------------------------------------------
+// Replay protection
+// ---------------------------------------------------------------------------
+
+fn check_replay(state: &HandlerState, ts: &str, nonce: &str) -> std::result::Result<(), &'static str> {
+    let ts_num: i64 = ts.parse().map_err(|_| "non-numeric timestamp")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if (now - ts_num).abs() > REPLAY_WINDOW_SECS {
+        return Err("timestamp outside ±300s window");
+    }
+    let mut cache = state
+        .nonce_cache
+        .lock()
+        .map_err(|_| "nonce cache poisoned")?;
+    let cutoff = Instant::now() - Duration::from_secs(REPLAY_WINDOW_SECS as u64);
+    cache.retain(|_, seen_at| *seen_at > cutoff);
+    if cache.contains_key(nonce) {
+        return Err("nonce already seen within replay window");
+    }
+    cache.insert(nonce.to_string(), Instant::now());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Reply cache (msg_id idempotency)
+// ---------------------------------------------------------------------------
+
+fn lookup_cached_reply(cache: &ReplyCache, msg_id: &str) -> Option<String> {
+    let mut map = cache.lock().ok()?;
+    let cutoff = Instant::now() - REPLY_CACHE_TTL;
+    map.retain(|_, e| e.inserted_at > cutoff);
+    map.get(msg_id).map(|e| e.reply_text.clone())
+}
+
+fn store_reply(cache: &ReplyCache, msg_id: &str, reply: String) {
+    if let Ok(mut map) = cache.lock() {
+        let cutoff = Instant::now() - REPLY_CACHE_TTL;
+        map.retain(|_, e| e.inserted_at > cutoff);
+        map.insert(
+            msg_id.to_string(),
+            CacheEntry {
+                inserted_at: Instant::now(),
+                reply_text: reply,
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+/// Truncate `text` to at most `max_chars` chars (not bytes). Appends an
+/// ellipsis when truncation happens so the user can tell the response was
+/// cut off, rather than silently losing the tail. Zero `max_chars` means
+/// "no cap" — defensive, the config validator already rejects 0.
+fn cap_reply_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return text.to_string();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let mut s: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    s.push('…');
+    s
+}
+
+/// Naive `<Encrypt>...</Encrypt>` extractor.
+fn extract_encrypt_element(xml: &str) -> std::result::Result<String, &'static str> {
     let open = xml.find("<Encrypt>").or_else(|| xml.find("<Encrypt "));
     let close = xml.find("</Encrypt>");
     let (Some(start), Some(end)) = (open, close) else {
@@ -244,7 +396,6 @@ fn extract_encrypt_element(xml: &str) -> Result<String, &'static str> {
         return Err("inverted Encrypt tags");
     }
     let inner = xml[after_open..end].trim();
-    // Strip optional CDATA wrapper.
     let stripped = inner
         .strip_prefix("<![CDATA[")
         .and_then(|s| s.strip_suffix("]]>"))
@@ -252,9 +403,9 @@ fn extract_encrypt_element(xml: &str) -> Result<String, &'static str> {
     Ok(stripped.trim().to_string())
 }
 
-/// Build the outer envelope WeChat expects for encrypted replies:
-/// `<xml><Encrypt>...</Encrypt><MsgSignature>...</MsgSignature>
-/// <TimeStamp>...</TimeStamp><Nonce>...</Nonce></xml>`.
+/// Build the outer envelope WeChat expects for encrypted replies. Uses a
+/// 64-bit nonce so collision probability stays negligible even under
+/// sustained traffic (birthday bound).
 fn wrap_encrypted_envelope(state: &HandlerState, inner_xml: &str) -> crate::error::Result<String> {
     let cfg = &*state.cfg;
     let aes_key = state
@@ -267,7 +418,7 @@ fn wrap_encrypted_envelope(state: &HandlerState, inner_xml: &str) -> crate::erro
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
         .to_string();
-    let nonce = format!("{:08x}", rand::random::<u32>());
+    let nonce = format!("{:016x}", rand::random::<u64>());
     let sig = signature::msg_signature(&cfg.wechat.token, &ts, &nonce, &encrypt);
     Ok(format!(
         "<xml>\
@@ -300,5 +451,127 @@ mod tests {
     fn extract_encrypt_errors_when_missing() {
         let xml = "<xml><MsgType>text</MsgType></xml>";
         assert!(extract_encrypt_element(xml).is_err());
+    }
+
+    #[test]
+    fn cap_reply_text_passes_short_text_through() {
+        assert_eq!(cap_reply_text("hello", 100), "hello");
+        assert_eq!(cap_reply_text("你好", 2), "你好");
+    }
+
+    #[test]
+    fn cap_reply_text_truncates_with_ellipsis() {
+        let out = cap_reply_text("一二三四五六七八九十", 5);
+        assert_eq!(out.chars().count(), 5);
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with("一二三四"));
+    }
+
+    #[test]
+    fn cap_reply_text_handles_zero_cap() {
+        // Defensive: 0 means "no cap" (config validator rejects 0, so
+        // this branch is unreachable in practice — still keep it safe).
+        assert_eq!(cap_reply_text("hello", 0), "hello");
+    }
+
+    fn make_state() -> HandlerState {
+        // We don't actually use cfg/pool/aes_key here — just need the
+        // shared caches. Build a minimal Config by hand.
+        use crate::config::*;
+        let cfg = Arc::new(Config {
+            server: ServerCfg {
+                bind: "127.0.0.1:8080".into(),
+                endpoint_path: "/wechat".into(),
+            },
+            wechat: WechatCfg {
+                token: "tok".into(),
+                app_id: "wxX".into(),
+                encoding_aes_key: String::new(),
+                encrypt_mode: EncryptMode::Plain,
+            },
+            evoclaw: EvoclawCfg::default(),
+            reply: ReplyCfg::default(),
+            log: LogCfg::default(),
+        });
+        // Pool is `Arc<BridgePool>` but the tests below never call into it,
+        // so a leaked Box pointing at uninhabited memory would be fine —
+        // but cleaner to dodge entirely by using `MaybeUninit::uninit` is
+        // unsafe; instead we use a dummy pool by spawning against `false`
+        // which is OK for these pure helper tests.
+        let pool = futures_executor_block_on(BridgePool::spawn("false", &[], 1));
+        let pool = match pool {
+            Ok(p) => Arc::new(p),
+            Err(_) => {
+                // Environment without /usr/bin/false — skip via a stub.
+                // We construct one by panicking; tests using HandlerState
+                // for non-pool code paths are the only callers.
+                panic!("test environment must provide a `false` binary");
+            }
+        };
+        HandlerState::new(cfg, pool, None)
+    }
+
+    /// Inline executor for the one sync test helper above (we can't add
+    /// futures-executor as a dep just for this; spawn via tokio runtime).
+    fn futures_executor_block_on<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(f)
+    }
+
+    #[test]
+    fn reply_cache_hit_returns_stored() {
+        let state = make_state();
+        store_reply(&state.reply_cache, "mid1", "cached-answer".into());
+        let got = lookup_cached_reply(&state.reply_cache, "mid1");
+        assert_eq!(got.as_deref(), Some("cached-answer"));
+    }
+
+    #[test]
+    fn reply_cache_miss_returns_none() {
+        let state = make_state();
+        assert!(lookup_cached_reply(&state.reply_cache, "never-seen").is_none());
+    }
+
+    #[test]
+    fn replay_rejects_old_timestamp() {
+        let state = make_state();
+        let ancient = "1000000000"; // year 2001
+        let err = check_replay(&state, ancient, "n1").unwrap_err();
+        assert!(err.contains("window"), "{err}");
+    }
+
+    #[test]
+    fn replay_rejects_non_numeric_timestamp() {
+        let state = make_state();
+        let err = check_replay(&state, "abc", "n1").unwrap_err();
+        assert!(err.contains("non-numeric"), "{err}");
+    }
+
+    #[test]
+    fn replay_rejects_repeated_nonce() {
+        let state = make_state();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        assert!(check_replay(&state, &now, "nonce-A").is_ok());
+        let err = check_replay(&state, &now, "nonce-A").unwrap_err();
+        assert!(err.contains("nonce already seen"), "{err}");
+    }
+
+    #[test]
+    fn replay_accepts_distinct_nonces() {
+        let state = make_state();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        assert!(check_replay(&state, &now, "nonce-X").is_ok());
+        assert!(check_replay(&state, &now, "nonce-Y").is_ok());
     }
 }

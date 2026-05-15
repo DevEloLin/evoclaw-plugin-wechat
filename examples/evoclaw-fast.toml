@@ -1,0 +1,45 @@
+# Recommended EvoClaw config for the WeChat passive-reply plugin.
+#
+# Drop this at ~/.evoclaw/config.toml (or whichever path your evoclaw
+# binary reads). The plugin's `extra_args` field can also point to it via
+# `extra_args = ["--config", "/abs/path/to/this/file"]` if you'd rather
+# keep your normal evoclaw config separate.
+#
+# The single goal of this file is to make EvoClaw respond inside WeChat's
+# 5-second window. Three knobs do almost all the work:
+#
+#   1. A *fast* model (DeepSeek / GPT-4o-mini / Qwen Turbo etc).
+#   2. `max_turns = 1` — never enter the tool-call loop.
+#   3. `reflection_enabled = false` — skip the post-task reflection pass.
+#
+# If you want EvoClaw to behave normally for CLI use, keep your regular
+# ~/.evoclaw/config.toml and instead start the plugin with
+# `extra_args = ["--config", "/path/to/this/file"]`.
+
+[model]
+# DeepSeek's chat model is one of the cheapest / fastest options for
+# Chinese conversation. Swap in your provider of choice — anything with
+# 1-2 second first-token latency works.
+provider = "deepseek"
+default = "deepseek-chat"
+
+[auth]
+# Plugin reads vault / env vars exactly like the CLI does. Either fill
+# secrets in ~/.evoclaw/vault.toml or export DEEPSEEK_API_KEY.
+method = "apikey"
+
+[runtime]
+# Hard limit: one model round per inbound message. No tool calls, no
+# multi-step planning — there isn't time for it within the 5s budget.
+max_turns = 1
+
+# Skip reflection (an extra LLM call that scores the task and updates
+# skill statistics). Saves ~1-3 seconds per request.
+reflection_enabled = false
+
+# Keep responses short — bot replies in WeChat have a ~2048-byte cap on
+# the <Content> element anyway, so trimming this also helps latency.
+max_tokens = 300
+
+# Bias toward concise, decisive answers.
+temperature = 0.4

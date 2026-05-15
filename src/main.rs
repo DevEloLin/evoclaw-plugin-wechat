@@ -62,6 +62,8 @@ async fn main() -> eyre::Result<()> {
             println!("  encrypt_mode: {:?}", cfg.wechat.encrypt_mode);
             println!("  worker_count: {}", cfg.evoclaw.worker_count);
             println!("  timeout_ms:   {}", cfg.evoclaw.timeout_ms);
+            println!("  max_chars:    {}", cfg.reply.max_chars);
+            verify_evoclaw_binary(&cfg.evoclaw.binary).await?;
             Ok(())
         }
         Cmd::Run { config } => {
@@ -97,7 +99,37 @@ fn init_tracing(level: &str) {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("evoclaw_plugin_wechat={level},evoclaw=info")));
-    fmt().with_env_filter(filter).with_target(false).init();
+    // `.try_init()` so the binary doesn't panic if some embedder ever
+    // installs a subscriber before us (e.g. inside an integration test).
+    let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+}
+
+/// Spawn `<binary> --version` and bail if it fails. `check` runs this so
+/// users find typos in `evoclaw.binary` immediately instead of at first
+/// webhook hit. A 5-second timeout protects against a hung binary.
+async fn verify_evoclaw_binary(binary: &str) -> eyre::Result<()> {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+    let fut = Command::new(binary).arg("--version").output();
+    let out = timeout(Duration::from_secs(5), fut)
+        .await
+        .map_err(|_| eyre::eyre!("`{binary} --version` took longer than 5s — wrong binary?"))?
+        .map_err(|e| {
+            eyre::eyre!(
+                "could not spawn `{binary} --version`: {e}. \
+                 Set `evoclaw.binary` to an absolute path in the config."
+            )
+        })?;
+    if !out.status.success() {
+        eyre::bail!(
+            "`{binary} --version` exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let v = String::from_utf8_lossy(&out.stdout);
+    println!("✓ evoclaw reachable: {}", v.trim());
+    Ok(())
 }
 
 async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
@@ -129,11 +161,7 @@ async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
     .await
     .map_err(|e| eyre::eyre!("{e}"))?;
 
-    let state = HandlerState {
-        cfg: cfg.clone(),
-        pool: Arc::new(pool),
-        aes_key,
-    };
+    let state = HandlerState::new(cfg.clone(), Arc::new(pool), aes_key);
 
     let app = Router::new()
         .route(
