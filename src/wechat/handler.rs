@@ -130,7 +130,7 @@ pub async fn handle_message(
 
     // Replay protection runs BEFORE signature verify so an attacker
     // replaying a valid signed envelope still gets shut down.
-    if let Err(why) = check_replay(&state, ts, nonce) {
+    if let Err(why) = check_replay(&state.nonce_cache, ts, nonce) {
         tracing::warn!(reason = why, "replay protection rejected request");
         return (StatusCode::FORBIDDEN, "replay rejected").into_response();
     }
@@ -316,7 +316,13 @@ async fn ask_with_timeout(state: &HandlerState, openid: &str, text: &str) -> Str
 // Replay protection
 // ---------------------------------------------------------------------------
 
-fn check_replay(state: &HandlerState, ts: &str, nonce: &str) -> std::result::Result<(), &'static str> {
+/// Reject replays. Takes the bare nonce cache (not `&HandlerState`) so unit
+/// tests don't need to materialize a full pool / runtime to exercise it.
+fn check_replay(
+    nonce_cache: &NonceCache,
+    ts: &str,
+    nonce: &str,
+) -> std::result::Result<(), &'static str> {
     let ts_num: i64 = ts.parse().map_err(|_| "non-numeric timestamp")?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -325,10 +331,7 @@ fn check_replay(state: &HandlerState, ts: &str, nonce: &str) -> std::result::Res
     if (now - ts_num).abs() > REPLAY_WINDOW_SECS {
         return Err("timestamp outside ±300s window");
     }
-    let mut cache = state
-        .nonce_cache
-        .lock()
-        .map_err(|_| "nonce cache poisoned")?;
+    let mut cache = nonce_cache.lock().map_err(|_| "nonce cache poisoned")?;
     let cutoff = Instant::now() - Duration::from_secs(REPLAY_WINDOW_SECS as u64);
     cache.retain(|_, seen_at| *seen_at > cutoff);
     if cache.contains_key(nonce) {
@@ -474,104 +477,66 @@ mod tests {
         assert_eq!(cap_reply_text("hello", 0), "hello");
     }
 
-    fn make_state() -> HandlerState {
-        // We don't actually use cfg/pool/aes_key here — just need the
-        // shared caches. Build a minimal Config by hand.
-        use crate::config::*;
-        let cfg = Arc::new(Config {
-            server: ServerCfg {
-                bind: "127.0.0.1:8080".into(),
-                endpoint_path: "/wechat".into(),
-            },
-            wechat: WechatCfg {
-                token: "tok".into(),
-                app_id: "wxX".into(),
-                encoding_aes_key: String::new(),
-                encrypt_mode: EncryptMode::Plain,
-            },
-            evoclaw: EvoclawCfg::default(),
-            reply: ReplyCfg::default(),
-            log: LogCfg::default(),
-        });
-        // Pool is `Arc<BridgePool>` but the tests below never call into it,
-        // so a leaked Box pointing at uninhabited memory would be fine —
-        // but cleaner to dodge entirely by using `MaybeUninit::uninit` is
-        // unsafe; instead we use a dummy pool by spawning against `false`
-        // which is OK for these pure helper tests.
-        let pool = futures_executor_block_on(BridgePool::spawn("false", &[], 1));
-        let pool = match pool {
-            Ok(p) => Arc::new(p),
-            Err(_) => {
-                // Environment without /usr/bin/false — skip via a stub.
-                // We construct one by panicking; tests using HandlerState
-                // for non-pool code paths are the only callers.
-                panic!("test environment must provide a `false` binary");
-            }
-        };
-        HandlerState::new(cfg, pool, None)
+    fn fresh_reply_cache() -> ReplyCache {
+        Arc::new(StdMutex::new(HashMap::new()))
     }
 
-    /// Inline executor for the one sync test helper above (we can't add
-    /// futures-executor as a dep just for this; spawn via tokio runtime).
-    fn futures_executor_block_on<F: std::future::Future>(f: F) -> F::Output {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(f)
+    fn fresh_nonce_cache() -> NonceCache {
+        Arc::new(StdMutex::new(HashMap::new()))
+    }
+
+    fn now_unix_str() -> String {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
     }
 
     #[test]
     fn reply_cache_hit_returns_stored() {
-        let state = make_state();
-        store_reply(&state.reply_cache, "mid1", "cached-answer".into());
-        let got = lookup_cached_reply(&state.reply_cache, "mid1");
-        assert_eq!(got.as_deref(), Some("cached-answer"));
+        let cache = fresh_reply_cache();
+        store_reply(&cache, "mid1", "cached-answer".into());
+        assert_eq!(
+            lookup_cached_reply(&cache, "mid1").as_deref(),
+            Some("cached-answer")
+        );
     }
 
     #[test]
     fn reply_cache_miss_returns_none() {
-        let state = make_state();
-        assert!(lookup_cached_reply(&state.reply_cache, "never-seen").is_none());
+        let cache = fresh_reply_cache();
+        assert!(lookup_cached_reply(&cache, "never-seen").is_none());
     }
 
     #[test]
     fn replay_rejects_old_timestamp() {
-        let state = make_state();
-        let ancient = "1000000000"; // year 2001
-        let err = check_replay(&state, ancient, "n1").unwrap_err();
+        let cache = fresh_nonce_cache();
+        let err = check_replay(&cache, "1000000000", "n1").unwrap_err();
         assert!(err.contains("window"), "{err}");
     }
 
     #[test]
     fn replay_rejects_non_numeric_timestamp() {
-        let state = make_state();
-        let err = check_replay(&state, "abc", "n1").unwrap_err();
+        let cache = fresh_nonce_cache();
+        let err = check_replay(&cache, "abc", "n1").unwrap_err();
         assert!(err.contains("non-numeric"), "{err}");
     }
 
     #[test]
     fn replay_rejects_repeated_nonce() {
-        let state = make_state();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        assert!(check_replay(&state, &now, "nonce-A").is_ok());
-        let err = check_replay(&state, &now, "nonce-A").unwrap_err();
+        let cache = fresh_nonce_cache();
+        let now = now_unix_str();
+        assert!(check_replay(&cache, &now, "nonce-A").is_ok());
+        let err = check_replay(&cache, &now, "nonce-A").unwrap_err();
         assert!(err.contains("nonce already seen"), "{err}");
     }
 
     #[test]
     fn replay_accepts_distinct_nonces() {
-        let state = make_state();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        assert!(check_replay(&state, &now, "nonce-X").is_ok());
-        assert!(check_replay(&state, &now, "nonce-Y").is_ok());
+        let cache = fresh_nonce_cache();
+        let now = now_unix_str();
+        assert!(check_replay(&cache, &now, "nonce-X").is_ok());
+        assert!(check_replay(&cache, &now, "nonce-Y").is_ok());
     }
 }

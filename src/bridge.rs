@@ -29,13 +29,25 @@
 
 use crate::error::{PluginError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex as AsyncMutex, RwLock};
+
+/// How long the pool waits after spawning before declaring all bridges
+/// alive. Most fatal startup failures (clap parse errors, missing API
+/// keys at first model touch, panic-in-init) surface inside ~100 ms;
+/// 500 ms is a generous safety margin without unduly delaying boot.
+const STARTUP_ALIVENESS_GRACE: Duration = Duration::from_millis(500);
+
+/// Bounded ring buffer for stderr capture per bridge. Big enough to keep
+/// the typical clap usage block + stack trace, small enough not to OOM
+/// if EvoClaw goes into a runaway log loop before dying.
+const STDERR_RING_CAP: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Wire types (mirrors of `evo_core::channel::*`)
@@ -99,10 +111,18 @@ impl Drop for PendingGuard {
 // Bridge
 // ---------------------------------------------------------------------------
 
+/// Ring buffer of the most recent stderr lines from a Bridge's subprocess.
+/// Used by `BridgePool` at startup so a diagnostic abort can quote the
+/// actual clap / panic message the user needs to fix, instead of just
+/// "bridge died — check logs".
+type StderrRing = Arc<StdMutex<VecDeque<String>>>;
+
 pub struct Bridge {
     stdin: AsyncMutex<ChildStdin>,
     pending: Arc<PendingMap>,
     alive: Arc<AtomicBool>,
+    /// Most recent stderr lines from the subprocess. Cap is `STDERR_RING_CAP`.
+    recent_stderr: StderrRing,
     /// Held so the OS process is killed if this Bridge is dropped while
     /// `alive == true` (i.e. the pool replaced it before stdout closed).
     _child: Child,
@@ -193,10 +213,19 @@ impl Bridge {
             }
         });
 
+        let recent_stderr: StderrRing =
+            Arc::new(StdMutex::new(VecDeque::with_capacity(STDERR_RING_CAP)));
         if let Some(stderr) = stderr {
+            let ring = recent_stderr.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(mut q) = ring.lock() {
+                        if q.len() >= STDERR_RING_CAP {
+                            q.pop_front();
+                        }
+                        q.push_back(line.clone());
+                    }
                     tracing::info!(target: "evoclaw", "{line}");
                 }
             });
@@ -206,8 +235,19 @@ impl Bridge {
             stdin: AsyncMutex::new(stdin),
             pending,
             alive,
+            recent_stderr,
             _child: child,
         })
+    }
+
+    /// Snapshot of the most recent stderr lines, oldest-first. Used by
+    /// the pool's startup aliveness check to quote the actual error
+    /// message in its abort diagnostic.
+    pub fn recent_stderr(&self) -> Vec<String> {
+        self.recent_stderr
+            .lock()
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Send one inbound message and wait for the matching reply. The
@@ -309,12 +349,44 @@ impl BridgePool {
         if count == 0 {
             return Err(PluginError::Config("BridgePool count must be >= 1".into()));
         }
-        let mut slots = Vec::with_capacity(count);
+        let mut slots: Vec<Arc<Slot>> = Vec::with_capacity(count);
         for i in 0..count {
             let b = Bridge::spawn(binary, extra_args).await.map_err(|e| {
                 PluginError::Backend(format!("spawn worker #{i}: {e}"))
             })?;
             slots.push(Arc::new(RwLock::new(Arc::new(b))));
+        }
+        // Startup aliveness check. `cmd.spawn()` returns Ok as soon as the
+        // OS forked the child — it does NOT tell us the child actually
+        // ran successfully. A typo in `extra_args`, an unsupported flag,
+        // or any other early exit means the OS process is gone within
+        // milliseconds. Without this check, the pool happily returns
+        // "alive-looking" Bridges that explode on first write; every
+        // webhook then falls back to canned text and the user has no
+        // signal at startup that anything is wrong. Sleeping briefly and
+        // re-checking gives us a chance to abort with the actual stderr.
+        tokio::time::sleep(STARTUP_ALIVENESS_GRACE).await;
+        for (idx, slot) in slots.iter().enumerate() {
+            let bridge = slot.read().await.clone();
+            if !bridge.is_alive() {
+                let captured = bridge.recent_stderr();
+                let stderr_block = if captured.is_empty() {
+                    "(no stderr captured — check that `binary` is correct \
+                     and executable)"
+                        .to_string()
+                } else {
+                    format!("captured stderr:\n  {}", captured.join("\n  "))
+                };
+                return Err(PluginError::Backend(format!(
+                    "evoclaw subprocess in slot #{idx} died within \
+                     {grace}ms of startup. Most likely causes: wrong \
+                     `evoclaw.binary` path, unsupported flag in \
+                     `evoclaw.extra_args` (check `evoclaw channel run \
+                     --help` against your binary), or missing API key \
+                     for the configured provider.\n{stderr_block}",
+                    grace = STARTUP_ALIVENESS_GRACE.as_millis(),
+                )));
+            }
         }
         Ok(Self {
             binary: binary.into(),
@@ -468,18 +540,126 @@ mod tests {
         assert!(format!("{err}").contains("dead"));
     }
 
+    /// Write a script to a unique tempfile, mark it executable, return
+    /// its path. The script ignores `$@` so it doesn't care about the
+    /// `channel run --kind local-pipe` argv that `Bridge::spawn` always
+    /// prepends — letting tests control behaviour via the script body
+    /// instead of CLI args.
+    fn write_test_script(suffix: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("evo-bridge-test-{suffix}-{stamp}.sh"));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
     #[tokio::test]
     async fn pool_respawns_dead_slot() {
-        // Pool of 1 against `false`. First checkout should still hand back
-        // *something* (the freshly-respawned slot — also a `false` that
-        // will die again, but the respawn loop will keep trying).
-        let pool = match BridgePool::spawn("false", &[], 1).await {
-            Ok(p) => p,
+        // We need a long-running subprocess so the pool's startup
+        // aliveness check passes; manually flip it dead afterwards to
+        // exercise checkout's respawn path. A shell script that reads
+        // stdin forever satisfies both.
+        let script = write_test_script("stay-alive", "cat > /dev/null");
+        let script_str = script.to_string_lossy().to_string();
+        let bridge = match Bridge::spawn(&script_str, &[]).await {
+            Ok(b) => b,
             Err(_) => return,
         };
-        // Wait for the first child to die so we exercise the respawn path.
+        let slot = Arc::new(RwLock::new(Arc::new(bridge)));
+        let pool = BridgePool {
+            binary: script_str,
+            extra_args: vec![],
+            slots: vec![slot.clone()],
+            next: AtomicUsize::new(0),
+        };
+        slot.read().await.alive.store(false, Ordering::Release);
+        let got = pool.checkout().await;
+        assert!(got.is_ok(), "pool should have respawned the dead slot");
+        assert!(got.unwrap().is_alive());
+        std::fs::remove_file(&script).ok();
+    }
+
+    #[tokio::test]
+    async fn pool_aborts_when_subprocess_dies_immediately() {
+        // The classic deployment-misconfig case: user has a typo in
+        // `evoclaw.extra_args`, evoclaw exits within ms with a clap
+        // error. The pool MUST surface this at startup. `false` exits
+        // immediately regardless of argv.
+        let err = match BridgePool::spawn("false", &[], 1).await {
+            Ok(_) => panic!("BridgePool::spawn must fail when subprocess dies immediately"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("died within"),
+            "error must mention the aliveness check, got: {msg}"
+        );
+        assert!(
+            msg.contains("extra_args") || msg.contains("binary"),
+            "error must hint at common misconfig causes, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_startup_check_includes_captured_stderr() {
+        // Script ignores its argv, emits a recognizable error line on
+        // stderr, then exits. The pool's startup check must surface the
+        // captured line in its abort message.
+        let script = write_test_script("emit-then-die", "echo BOOM 1>&2\nexit 1");
+        let script_str = script.to_string_lossy().to_string();
+        let err = match BridgePool::spawn(&script_str, &[], 1).await {
+            Ok(_) => {
+                std::fs::remove_file(&script).ok();
+                panic!("expected pool spawn to fail");
+            }
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        std::fs::remove_file(&script).ok();
+        assert!(
+            msg.contains("BOOM"),
+            "stderr capture should surface the actual error line, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_stderr_is_bounded() {
+        // Emit 200 stderr lines (more than STDERR_RING_CAP=64), then
+        // sleep so the bridge stays alive long enough to snapshot.
+        let script = write_test_script(
+            "ring-buffer",
+            "for i in $(seq 1 200); do echo line-$i 1>&2; done\nsleep 5",
+        );
+        let script_str = script.to_string_lossy().to_string();
+        let b = match Bridge::spawn(&script_str, &[]).await {
+            Ok(b) => b,
+            Err(_) => {
+                std::fs::remove_file(&script).ok();
+                return;
+            }
+        };
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let _ = pool.checkout().await;
-        // Just exercising the code path — no panic == success.
+        let snap = b.recent_stderr();
+        std::fs::remove_file(&script).ok();
+        assert!(
+            snap.len() <= STDERR_RING_CAP,
+            "ring buffer must respect cap (got {} > {})",
+            snap.len(),
+            STDERR_RING_CAP
+        );
+        if !snap.is_empty() {
+            // Eviction is FIFO, so the freshest line must be high-numbered.
+            let last = snap.last().unwrap();
+            assert!(
+                last.starts_with("line-2") || last.starts_with("line-1"),
+                "ring buffer should keep recent lines, got last={last}"
+            );
+        }
     }
 }
