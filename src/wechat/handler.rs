@@ -109,7 +109,10 @@ pub async fn verify_url(
     };
     let expected = signature::plain_signature(&state.cfg.wechat.token, &ts, &nonce);
     if !signature::verify(&expected, &sig) {
-        tracing::warn!(supplied = %sig, expected = %expected, "GET signature mismatch");
+        // Only the supplied signature is logged — the expected one is
+        // recomputable from token+ts+nonce, and logging it just gives a
+        // would-be attacker reading the logs less work to do.
+        tracing::warn!(supplied = %sig, "GET signature mismatch");
         return (StatusCode::FORBIDDEN, "signature mismatch").into_response();
     }
     tracing::info!("URL verification succeeded");
@@ -318,6 +321,17 @@ async fn ask_with_timeout(state: &HandlerState, openid: &str, text: &str) -> Str
 
 /// Reject replays. Takes the bare nonce cache (not `&HandlerState`) so unit
 /// tests don't need to materialize a full pool / runtime to exercise it.
+///
+/// Two time sources by design (not a bug):
+///
+/// * The timestamp-window check uses `SystemTime` (wall clock) because the
+///   inbound `timestamp` query parameter is a wall-clock unix seconds
+///   value emitted by WeChat's servers — comparing it against `Instant`
+///   would be a category error.
+/// * The nonce cache TTL uses `Instant` (monotonic) so the cache cleanup
+///   logic stays correct across NTP adjustments and DST jumps. The cache
+///   resets on every process restart anyway, so monotonic-vs-wall-clock
+///   drift across restarts is a non-issue.
 fn check_replay(
     nonce_cache: &NonceCache,
     ts: &str,

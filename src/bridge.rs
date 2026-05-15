@@ -40,14 +40,26 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex, RwLock};
 
 /// How long the pool waits after spawning before declaring all bridges
 /// alive. Most fatal startup failures (clap parse errors, missing API
-/// keys at first model touch, panic-in-init) surface inside ~100 ms;
-/// 500 ms is a generous safety margin without unduly delaying boot.
-const STARTUP_ALIVENESS_GRACE: Duration = Duration::from_millis(500);
+/// keys at first model touch, panic-in-init) surface inside ~100 ms.
+/// Originally 500 ms, but under heavy parallel test load on macOS a
+/// fresh `sh` invocation can take >500 ms to schedule + run + exit,
+/// which made the aliveness check race the subprocess EOF. 1 s is still
+/// short enough that real users barely notice startup latency, but wide
+/// enough to absorb scheduler jitter on contended CI hosts.
+const STARTUP_ALIVENESS_GRACE: Duration = Duration::from_millis(1000);
 
 /// Bounded ring buffer for stderr capture per bridge. Big enough to keep
 /// the typical clap usage block + stack trace, small enough not to OOM
 /// if EvoClaw goes into a runaway log loop before dying.
 const STDERR_RING_CAP: usize = 64;
+
+/// Cooldown after a failed `Bridge::spawn` inside `checkout()`. Without
+/// this, a permanently-broken state (binary deleted, disk full, etc.)
+/// would let every webhook trigger up to `2 * worker_count` spawn
+/// attempts back-to-back — a fork storm under any sustained traffic.
+/// One second is short enough that transient failures recover quickly
+/// but long enough to amortize the cost over many requests.
+const RESPAWN_COOLDOWN: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Wire types (mirrors of `evo_core::channel::*`)
@@ -185,9 +197,22 @@ impl Bridge {
                 }
                 match serde_json::from_str::<OutboundMessage>(&line) {
                     Ok(msg) => {
-                        let entry = reader_pending.lock().ok().and_then(|mut m| {
-                            m.remove(&msg.conversation_id)
-                        });
+                        // Mutex poisoning here means an `ask()` caller
+                        // panicked while holding the lock — unrecoverable
+                        // for this bridge. Mark dead so the pool respawns
+                        // it on next checkout instead of silently dropping
+                        // every subsequent reply.
+                        let entry = match reader_pending.lock() {
+                            Ok(mut m) => m.remove(&msg.conversation_id),
+                            Err(_) => {
+                                tracing::error!(
+                                    "bridge: pending mutex poisoned; \
+                                     marking bridge dead so pool can respawn"
+                                );
+                                reader_alive.store(false, Ordering::Release);
+                                break;
+                            }
+                        };
                         if let Some(tx) = entry {
                             let _ = tx.send(msg.text);
                         } else {
@@ -205,10 +230,11 @@ impl Bridge {
             }
             tracing::info!("bridge: subprocess stdout closed, marking dead");
             reader_alive.store(false, Ordering::Release);
+            // Drain pending so the awaiters' rx.await returns Err
+            // immediately instead of hanging until their caller-level
+            // timeout. If the mutex is poisoned here, awaiters will still
+            // time out gracefully — slightly slower but not broken.
             if let Ok(mut map) = reader_pending.lock() {
-                // Dropping each sender causes its receiver to error out
-                // with `RecvError`, which `ask()` translates into a
-                // "subprocess died before reply" PluginError.
                 map.clear();
             }
         });
@@ -342,6 +368,11 @@ pub struct BridgePool {
     extra_args: Vec<String>,
     slots: Vec<Arc<Slot>>,
     next: AtomicUsize,
+    /// Most recent moment at which `Bridge::spawn` failed during a
+    /// respawn attempt. While inside the `RESPAWN_COOLDOWN` window, the
+    /// pool returns the "all bridges dead" error immediately instead of
+    /// hammering the failing binary again. See `RESPAWN_COOLDOWN`.
+    last_respawn_failed_at: StdMutex<Option<std::time::Instant>>,
 }
 
 impl BridgePool {
@@ -393,7 +424,29 @@ impl BridgePool {
             extra_args: extra_args.to_vec(),
             slots,
             next: AtomicUsize::new(0),
+            last_respawn_failed_at: StdMutex::new(None),
         })
+    }
+
+    /// True iff the pool is inside its respawn cooldown window, meaning a
+    /// recent `Bridge::spawn` call from `checkout()` failed and we should
+    /// skip further spawn attempts for now.
+    fn in_respawn_cooldown(&self) -> bool {
+        match self.last_respawn_failed_at.lock() {
+            Ok(g) => g
+                .as_ref()
+                .is_some_and(|t| t.elapsed() < RESPAWN_COOLDOWN),
+            // Lock poisoning shouldn't happen here (we only ever do a tiny
+            // mutate-and-drop), but be conservative and assume "no cooldown"
+            // so we don't get stuck permanently.
+            Err(_) => false,
+        }
+    }
+
+    fn mark_respawn_failed(&self) {
+        if let Ok(mut g) = self.last_respawn_failed_at.lock() {
+            *g = Some(std::time::Instant::now());
+        }
     }
 
     /// Pick the next slot round-robin. If the slot's Bridge is dead,
@@ -401,6 +454,7 @@ impl BridgePool {
     /// Errors only when *every* slot is dead and *every* respawn failed.
     pub async fn checkout(&self) -> Result<Arc<Bridge>> {
         let n = self.slots.len();
+
         // Walk every slot at most twice so a transient respawn failure on
         // one slot doesn't lock us into "no live bridges".
         for _ in 0..(n * 2) {
@@ -415,9 +469,16 @@ impl BridgePool {
                 }
             }
 
-            // Slow path: dead, take write lock and try respawn. Re-check
-            // alive after acquiring the write lock to handle the case
-            // where another task already replaced the slot.
+            // Slow path: dead. Check cooldown HERE (not cached at function
+            // entry) so a failure inside this same checkout call updates
+            // the next iteration's behaviour immediately.
+            if self.in_respawn_cooldown() {
+                continue;
+            }
+
+            // Take the write lock and try respawn. Re-check alive after
+            // acquiring the lock so we don't race another task that
+            // already replaced the slot.
             let mut wg = slot.write().await;
             if wg.is_alive() {
                 return Ok(wg.clone());
@@ -429,14 +490,20 @@ impl BridgePool {
                     return Ok(wg.clone());
                 }
                 Err(e) => {
-                    tracing::error!(slot = idx, error = %e, "respawn failed; trying next slot");
-                    // Keep going — maybe another slot is live.
+                    tracing::error!(slot = idx, error = %e, "respawn failed; entering cooldown");
+                    self.mark_respawn_failed();
+                    // Next iteration's `in_respawn_cooldown()` check will
+                    // return true, so we walk the remaining dead slots
+                    // without further spawn attempts.
                 }
             }
         }
-        Err(PluginError::Backend(
-            "all bridge slots dead and respawn failed".into(),
-        ))
+        Err(PluginError::Backend(if self.in_respawn_cooldown() {
+            "all bridge slots dead; in respawn cooldown after recent failure"
+                .into()
+        } else {
+            "all bridge slots dead and respawn failed".into()
+        }))
     }
 }
 
@@ -560,6 +627,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_cooldown_blocks_immediate_respawn_after_failure() {
+        // Build a pool by hand: one slot with a live "stay-alive" bridge,
+        // but configure the pool to respawn against `/nonexistent-binary`
+        // so any failed-slot respawn attempt will fail immediately.
+        let stay_alive = write_test_script("cooldown-stay", "cat > /dev/null");
+        let stay_alive_str = stay_alive.to_string_lossy().to_string();
+        let bridge = match Bridge::spawn(&stay_alive_str, &[]).await {
+            Ok(b) => b,
+            Err(_) => {
+                std::fs::remove_file(&stay_alive).ok();
+                return;
+            }
+        };
+        let slot = Arc::new(RwLock::new(Arc::new(bridge)));
+        let pool = BridgePool {
+            binary: "/nonexistent-binary-for-cooldown-test".into(),
+            extra_args: vec![],
+            slots: vec![slot.clone()],
+            next: AtomicUsize::new(0),
+            last_respawn_failed_at: StdMutex::new(None),
+        };
+        // Manually mark the bridge dead so checkout MUST try to respawn.
+        slot.read().await.alive.store(false, Ordering::Release);
+
+        // First checkout: respawn against nonexistent binary fails →
+        // marks cooldown → checkout returns Err.
+        let r1 = pool.checkout().await;
+        assert!(r1.is_err(), "first checkout should fail (binary missing)");
+        assert!(pool.in_respawn_cooldown(), "cooldown must engage after failure");
+
+        // Second checkout: cooldown still active → should NOT attempt
+        // another spawn (we'd see two spawn-failures in logs if it did).
+        // Just verify the error variant changes wording to "in cooldown".
+        let err = match pool.checkout().await {
+            Ok(_) => panic!("expected Err while in cooldown"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("cooldown"),
+            "second checkout while in cooldown should mention cooldown: {err}"
+        );
+
+        std::fs::remove_file(&stay_alive).ok();
+    }
+
+    #[tokio::test]
     async fn pool_respawns_dead_slot() {
         // We need a long-running subprocess so the pool's startup
         // aliveness check passes; manually flip it dead afterwards to
@@ -577,6 +690,7 @@ mod tests {
             extra_args: vec![],
             slots: vec![slot.clone()],
             next: AtomicUsize::new(0),
+            last_respawn_failed_at: StdMutex::new(None),
         };
         slot.read().await.alive.store(false, Ordering::Release);
         let got = pool.checkout().await;
