@@ -130,17 +130,23 @@ WeChat user → WeChat server → POST https://bot.example.com/wechat
 - Plugin reserves **500 ms** for network / TLS / proxy overhead
 - That leaves **4.5 s** for EvoClaw + LLM
 - For best fit, configure EvoClaw to use a fast small model
-  (`deepseek-chat`, `gpt-4o-mini`, `qwen-turbo`) and **disable tool
-  calling** + **disable reflection**. A drop-in template is shipped at
-  [`examples/evoclaw-fast.toml`](examples/evoclaw-fast.toml); the
-  simplest deploy points the plugin at it via:
+  (`deepseek-chat`, `gpt-4o-mini`, `qwen-turbo`). A drop-in template
+  ships at [`examples/evoclaw-fast.toml`](examples/evoclaw-fast.toml).
+  Copy it to `~/.evoclaw/config.toml`:
 
-  ```toml
-  # in ~/.evoclaw/plugins/wechat.toml
-  [evoclaw]
-  binary     = "evoclaw"
-  extra_args = ["--config", "/absolute/path/to/evoclaw-fast.toml"]
+  ```bash
+  cp examples/evoclaw-fast.toml ~/.evoclaw/config.toml
+  # then `evoclaw doctor` to verify
   ```
+
+  Caveat: EvoClaw's `channel run` currently uses `RuntimeConfig::default()`,
+  which has `reflection_enabled = true`, `max_turns = 25`, and all
+  built-in tools registered. These cannot be overridden from config.toml
+  today. Reflection alone adds ~1-3s per request — most of the slack in
+  the 5s budget. If you hit frequent timeouts, ask upstream EvoClaw to
+  expose `--no-reflection --max-turns N` flags on `channel run`; the
+  plugin's `evoclaw.extra_args` config field is already wired to pass
+  them through.
 
 ## Reliability features
 
