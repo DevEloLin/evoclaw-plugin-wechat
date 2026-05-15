@@ -1,45 +1,73 @@
 # Recommended EvoClaw config for the WeChat passive-reply plugin.
 #
-# Drop this at ~/.evoclaw/config.toml (or whichever path your evoclaw
-# binary reads). The plugin's `extra_args` field can also point to it via
-# `extra_args = ["--config", "/abs/path/to/this/file"]` if you'd rather
-# keep your normal evoclaw config separate.
+# NOTE: EvoClaw currently reads its config from a fixed path
+# (`~/.evoclaw/config.toml`) — there is no `--config <path>` flag yet.
+# So this file is a **template to copy** into that location, not a config
+# the plugin can point at directly via `extra_args`.
 #
-# The single goal of this file is to make EvoClaw respond inside WeChat's
-# 5-second window. Three knobs do almost all the work:
+# Procedure:
+#   1. Back up your existing config:
+#        cp ~/.evoclaw/config.toml ~/.evoclaw/config.toml.bak
+#   2. Replace with this template:
+#        cp examples/evoclaw-fast.toml ~/.evoclaw/config.toml
+#   3. Fill in your real api-key under [auth] (or use the vault).
+#   4. Run `evoclaw doctor` to confirm it parses.
 #
-#   1. A *fast* model (DeepSeek / GPT-4o-mini / Qwen Turbo etc).
-#   2. `max_turns = 1` — never enter the tool-call loop.
-#   3. `reflection_enabled = false` — skip the post-task reflection pass.
+# What we CAN tune via this file (limits the 5-second budget):
 #
-# If you want EvoClaw to behave normally for CLI use, keep your regular
-# ~/.evoclaw/config.toml and instead start the plugin with
-# `extra_args = ["--config", "/path/to/this/file"]`.
+#   * model.provider / model.default — pick a fast model. DeepSeek's
+#     `deepseek-chat` typically replies in 1-2s; GPT-4o-mini is similar;
+#     Qwen Turbo even faster for short Chinese answers.
+#
+# What we CANNOT tune via this file today:
+#
+#   * `max_turns`, `max_tokens`, `temperature`, `reflection_enabled` —
+#     these are `RuntimeConfig` fields baked into EvoClaw's defaults
+#     (25 turns / 4096 tokens / 0.2 / reflection ON). They cannot be
+#     overridden from config.toml in current EvoClaw. With reflection
+#     enabled, every channel message costs an extra ~1-3 second LLM
+#     round, which eats into the 5s WeChat budget.
+#
+#     If your replies frequently timeout, ask the EvoClaw maintainers
+#     to expose CLI flags on `evoclaw channel run` (e.g. `--no-reflection
+#     --max-turns 1`), then add them to `evoclaw.extra_args` in
+#     ~/.evoclaw/plugins/wechat.toml. Tracked as an upstream feature
+#     request; this plugin's bridge already passes `extra_args` through.
+#
+# What about tool calling?
+#
+#   `channel run` registers ALL built-in tools by default. A fast small
+#   model usually just answers in turn 1 for plain conversational input,
+#   but if your prompts encourage tool use (e.g. "search the web for…"),
+#   you'll trip the 5s budget. Keep the public-account persona simple.
 
 [model]
-# DeepSeek's chat model is one of the cheapest / fastest options for
-# Chinese conversation. Swap in your provider of choice — anything with
-# 1-2 second first-token latency works.
 provider = "deepseek"
-default = "deepseek-chat"
+default  = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+fallback = []
 
 [auth]
-# Plugin reads vault / env vars exactly like the CLI does. Either fill
-# secrets in ~/.evoclaw/vault.toml or export DEEPSEEK_API_KEY.
-method = "apikey"
+# `api_key`, `apikey`, or `key` all map to the same enum. Use one.
+# The actual key comes from $DEEPSEEK_API_KEY or ~/.evoclaw/vault.toml —
+# never put it in plaintext here.
+method = "api_key"
 
-[runtime]
-# Hard limit: one model round per inbound message. No tool calls, no
-# multi-step planning — there isn't time for it within the 5s budget.
-max_turns = 1
+[budget]
+# These are advisory budgets. Set them generously for WeChat traffic so
+# the bridge doesn't get blocked mid-conversation. Tighten later if you
+# want hard spending caps.
+per_task_usd  = 0.02
+per_day_usd   = 5.0
+per_month_usd = 50.0
 
-# Skip reflection (an extra LLM call that scores the task and updates
-# skill statistics). Saves ~1-3 seconds per request.
-reflection_enabled = false
+[security]
+# P1 = "allow most read-only operations without prompting". Channel mode
+# already disables ask-user prompts (`allow_user_prompt = false`), so
+# higher trust levels here mainly affect manual CLI sessions.
+default_permission   = "P1"
+high_risk_intercept  = true
 
-# Keep responses short — bot replies in WeChat have a ~2048-byte cap on
-# the <Content> element anyway, so trimming this also helps latency.
-max_tokens = 300
-
-# Bias toward concise, decisive answers.
-temperature = 0.4
+# Optional logging override.
+# [logs]
+# dir = "~/.evoclaw/logs"
