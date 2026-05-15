@@ -131,8 +131,39 @@ WeChat user → WeChat server → POST https://bot.example.com/wechat
 - That leaves **4.5 s** for EvoClaw + LLM
 - For best fit, configure EvoClaw to use a fast small model
   (`deepseek-chat`, `gpt-4o-mini`, `qwen-turbo`) and **disable tool
-  calling** (set `max_turns = 1` in your evoclaw config, or pass a
-  thinner runtime config via `evoclaw.extra_args`)
+  calling** + **disable reflection**. A drop-in template is shipped at
+  [`examples/evoclaw-fast.toml`](examples/evoclaw-fast.toml); the
+  simplest deploy points the plugin at it via:
+
+  ```toml
+  # in ~/.evoclaw/plugins/wechat.toml
+  [evoclaw]
+  binary     = "evoclaw"
+  extra_args = ["--config", "/absolute/path/to/evoclaw-fast.toml"]
+  ```
+
+## Reliability features
+
+The plugin is hardened against the failure modes that bite WeChat
+passive-reply bridges in practice:
+
+- **Subprocess pool with respawn** — if an `evoclaw` worker crashes, the
+  pool transparently respawns it on the next checkout instead of
+  returning a dead handle forever.
+- **Cancellation-safe pending map** — when a request times out, the
+  pending entry is removed via a RAII guard, so a hung subprocess can't
+  leak memory.
+- **Default 4 workers** — single-worker pools serialise requests and
+  almost guarantee timeouts for concurrent users; the default catches
+  bursty traffic typical of WeChat public accounts.
+- **`msg_id` reply cache (60 s)** — WeChat retries failed requests with
+  the same `MsgId`. The plugin returns the cached reply on retry
+  instead of triggering a duplicate LLM call.
+- **Replay protection** — every inbound request must carry a timestamp
+  inside a ±300 s window and a nonce unseen in the last 300 s.
+- **Reply length cap (default 600 chars)** — responses longer than the
+  configured `reply.max_chars` are truncated with an ellipsis, keeping
+  the XML envelope under WeChat's `<Content>` byte limit.
 
 ## Limitations
 
@@ -160,9 +191,10 @@ Key fields:
 | `wechat.encrypt_mode` | `plain` / `compatible` / `safe` |
 | `evoclaw.binary` | Path or PATH name of the `evoclaw` binary |
 | `evoclaw.timeout_ms` | Per-message hard timeout (must be ≤ 4900) |
-| `evoclaw.worker_count` | Number of long-running `evoclaw` subprocesses |
+| `evoclaw.worker_count` | Number of long-running `evoclaw` subprocesses (default 4) |
 | `reply.fallback` | Text shown when LLM times out or fails |
 | `reply.welcome` | Sent on `subscribe` event (empty = silent) |
+| `reply.max_chars` | Truncate replies past this many chars (default 600) |
 
 ## License
 

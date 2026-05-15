@@ -37,9 +37,11 @@ extra_args = []
 # 单条消息的总超时(毫秒)。微信硬超时是 5 秒,这里默认 4500 留 500ms 余量。
 timeout_ms = 4500
 
-# 子进程池大小。低流量场景用 1 即可;高并发场景增大此值。
-# 注意:每个子进程都是一个完整 evoclaw 实例,会占用内存。
-worker_count = 1
+# 子进程池大小。
+# 注意:EvoClaw 的 channel run 内部串行处理消息——worker_count=1 时,两个用户
+# 几乎同时发消息,第二人 100% 会撞 5s 超时。默认 4 覆盖个人/小商户常见突发流量;
+# 高并发场景再加大。每多一个 worker = 多一份 EvoClaw 进程内存开销。
+worker_count = 4
 
 [reply]
 # 超时或后端失败时返回的兜底文案。
@@ -51,6 +53,10 @@ welcome = "您好!我是 AI 助手,直接发消息向我提问即可。"
 # 不识别的事件类型默认是否回复(关注/取关/菜单点击等)。
 # false = 静默;true = 用 reply.fallback 回复。
 echo_unknown_event = false
+
+# 回复文本最大字符数(不是字节数)。WeChat 被动回复 text 元素上限约 2048 字节,
+# 600 个中文字符 ≈ 1800 字节,够 XML 信封头开销。超长回复会被截断并加省略号。
+max_chars = 600
 
 [log]
 # trace | debug | info | warn | error

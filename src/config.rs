@@ -81,7 +81,13 @@ fn default_timeout() -> u64 {
     4500
 }
 fn default_workers() -> usize {
-    1
+    // EvoClaw's `channel run` processes inbound messages serially within a
+    // single subprocess. With worker_count=1, two concurrent users will
+    // queue back-to-back and the second one almost always trips the 5s
+    // WeChat timeout. Four workers covers the low-burst pattern of most
+    // personal/SMB public accounts; bump higher if you expect concurrent
+    // bursts.
+    4
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +98,13 @@ pub struct ReplyCfg {
     pub welcome: String,
     #[serde(default)]
     pub echo_unknown_event: bool,
+    /// Maximum number of *characters* (not bytes) in the reply text.
+    /// WeChat's passive-reply text element accepts up to ~2048 bytes; a
+    /// 600-char Chinese reply uses ~1800 bytes UTF-8 which leaves room
+    /// for the XML envelope. Replies longer than this are truncated with
+    /// an ellipsis so the user at least sees the beginning of the answer.
+    #[serde(default = "default_max_chars")]
+    pub max_chars: usize,
 }
 
 impl Default for ReplyCfg {
@@ -100,12 +113,17 @@ impl Default for ReplyCfg {
             fallback: default_fallback(),
             welcome: String::new(),
             echo_unknown_event: false,
+            max_chars: default_max_chars(),
         }
     }
 }
 
 fn default_fallback() -> String {
     "我还在想这个问题,请换个简单的问法,或稍后再试一次。".into()
+}
+
+fn default_max_chars() -> usize {
+    600
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -159,6 +177,12 @@ impl Config {
         if self.evoclaw.worker_count == 0 {
             return Err(PluginError::Config("evoclaw.worker_count must be >= 1".into()));
         }
+        if self.reply.max_chars == 0 {
+            return Err(PluginError::Config(
+                "reply.max_chars must be >= 1 (recommended 600 for safe WeChat byte budget)"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -188,7 +212,8 @@ app_id = "wx123"
         let cfg = Config::from_path(f.path()).await.unwrap();
         assert_eq!(cfg.wechat.encrypt_mode, EncryptMode::Plain);
         assert_eq!(cfg.evoclaw.timeout_ms, 4500);
-        assert_eq!(cfg.evoclaw.worker_count, 1);
+        assert_eq!(cfg.evoclaw.worker_count, default_workers());
+        assert_eq!(cfg.reply.max_chars, default_max_chars());
     }
 
     #[tokio::test]
