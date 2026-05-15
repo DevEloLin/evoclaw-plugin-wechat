@@ -1,0 +1,178 @@
+//! evoclaw-plugin-wechat — passive-reply webhook bridging WeChat Official
+//! Account messages into a local `evoclaw` runtime via the stdio local-pipe
+//! channel protocol.
+//!
+//! Run with `evoclaw-plugin-wechat run --config path/to/wechat.toml`.
+
+mod bridge;
+mod config;
+mod error;
+mod wechat;
+
+use crate::bridge::BridgePool;
+use crate::config::{Config, EncryptMode};
+use crate::wechat::handler::{handle_message, verify_url, HandlerState};
+use axum::{routing::get, Router};
+use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::trace::TraceLayer;
+
+const DEFAULT_CONFIG_HINT: &str = "~/.evoclaw/plugins/wechat.toml";
+
+#[derive(Parser)]
+#[command(name = "evoclaw-plugin-wechat", version, about = "WeChat Official Account passive-reply bridge for EvoClaw")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Start the webhook server.
+    Run {
+        /// Path to TOML config. Defaults to ~/.evoclaw/plugins/wechat.toml.
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+    },
+    /// Validate a config file without starting the server.
+    Check {
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+    },
+    /// Print an example config to stdout.
+    InitConfig,
+}
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::InitConfig => {
+            print!("{}", include_str!("../config.example.toml"));
+            Ok(())
+        }
+        Cmd::Check { config } => {
+            let path = resolve_config_path(config)?;
+            let cfg = Config::from_path(&path).await?;
+            println!("✓ config valid: {}", path.display());
+            println!("  endpoint:     {}{}", cfg.server.bind, cfg.server.endpoint_path);
+            println!("  encrypt_mode: {:?}", cfg.wechat.encrypt_mode);
+            println!("  worker_count: {}", cfg.evoclaw.worker_count);
+            println!("  timeout_ms:   {}", cfg.evoclaw.timeout_ms);
+            Ok(())
+        }
+        Cmd::Run { config } => {
+            let path = resolve_config_path(config)?;
+            let cfg = Arc::new(Config::from_path(&path).await?);
+            init_tracing(&cfg.log.level);
+            tracing::info!(path = %path.display(), "loaded config");
+            run_server(cfg).await
+        }
+    }
+}
+
+fn resolve_config_path(explicit: Option<PathBuf>) -> eyre::Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| eyre::eyre!("HOME not set and no --config given"))?;
+    let p = PathBuf::from(home).join(".evoclaw").join("plugins").join("wechat.toml");
+    if !p.exists() {
+        eyre::bail!(
+            "no config at {} (expected: {}). Pass --config <path> or run \
+             `evoclaw-plugin-wechat init-config > {}` to scaffold one.",
+            p.display(),
+            DEFAULT_CONFIG_HINT,
+            p.display()
+        );
+    }
+    Ok(p)
+}
+
+fn init_tracing(level: &str) {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("evoclaw_plugin_wechat={level},evoclaw=info")));
+    fmt().with_env_filter(filter).with_target(false).init();
+}
+
+async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
+    let bind: SocketAddr = cfg
+        .server
+        .bind
+        .parse()
+        .map_err(|e| eyre::eyre!("invalid server.bind '{}': {e}", cfg.server.bind))?;
+
+    // Pre-decode the AES key once so per-request handlers don't redo it.
+    let aes_key = match cfg.wechat.encrypt_mode {
+        EncryptMode::Plain => None,
+        EncryptMode::Compatible | EncryptMode::Safe => Some(Arc::new(
+            wechat::crypto::decode_aes_key(&cfg.wechat.encoding_aes_key)
+                .map_err(|e| eyre::eyre!("{e}"))?,
+        )),
+    };
+
+    tracing::info!(
+        binary = %cfg.evoclaw.binary,
+        workers = cfg.evoclaw.worker_count,
+        "spawning evoclaw subprocess pool"
+    );
+    let pool = BridgePool::spawn(
+        &cfg.evoclaw.binary,
+        &cfg.evoclaw.extra_args,
+        cfg.evoclaw.worker_count,
+    )
+    .await
+    .map_err(|e| eyre::eyre!("{e}"))?;
+
+    let state = HandlerState {
+        cfg: cfg.clone(),
+        pool: Arc::new(pool),
+        aes_key,
+    };
+
+    let app = Router::new()
+        .route(
+            &cfg.server.endpoint_path,
+            get(verify_url).post(handle_message),
+        )
+        .route("/healthz", get(|| async { "ok" }))
+        // WeChat POSTs are tiny (~1 KB). 64 KB caps any abuse.
+        .layer(RequestBodyLimitLayer::new(64 * 1024))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|e| eyre::eyre!("bind {bind}: {e}"))?;
+    tracing::info!(addr = %bind, path = %cfg.server.endpoint_path, "ready");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received");
+}

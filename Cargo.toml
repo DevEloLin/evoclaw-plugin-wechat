@@ -1,0 +1,46 @@
+[package]
+name = "evoclaw-plugin-wechat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "WeChat Official Account passive-reply bridge for the EvoClaw agent runtime"
+license = "MIT"
+repository = "https://github.com/your-org/evoclaw-plugin-wechat"
+readme = "README.md"
+keywords = ["wechat", "weixin", "evoclaw", "agent", "llm"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "evoclaw-plugin-wechat"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["trace", "limit"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+quick-xml = { version = "0.36", features = ["serialize"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eyre = "0.6"
+thiserror = "1"
+async-trait = "0.1"
+
+# Crypto stack for 安全模式 / 兼容模式 (AES-256-CBC + PKCS7)
+sha1 = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+base64 = "0.22"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+hex = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

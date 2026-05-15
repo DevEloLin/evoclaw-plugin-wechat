@@ -1,0 +1,57 @@
+# evoclaw-plugin-wechat — example configuration
+# Copy this to ~/.evoclaw/plugins/wechat.toml (or any path you pass via --config)
+# and fill in the values from 微信公众平台 → 基本配置.
+
+[server]
+# HTTP bind address. TLS is expected to be terminated by a reverse proxy
+# (nginx, caddy, ...) because WeChat only POSTs to HTTPS endpoints with a
+# verified ICP-filed domain. The plugin itself stays plain HTTP behind it.
+bind = "127.0.0.1:8080"
+# WeChat 后台配置的服务器 URL 路径,例如填 https://example.com/wechat 则:
+endpoint_path = "/wechat"
+
+[wechat]
+# 公众平台 → 基本配置 → 服务器配置 → Token
+token = "REPLACE_ME"
+
+# 公众平台 → 基本配置 → 开发者ID(AppID)
+app_id = "wx_REPLACE_ME"
+
+# 公众平台 → 基本配置 → 服务器配置 → 消息加解密密钥 (EncodingAESKey)
+# 明文模式留空;兼容模式 / 安全模式必须填(43 位字符)。
+encoding_aes_key = ""
+
+# "plain" | "compatible" | "safe"
+# - plain      : 明文模式(EncodingAESKey 留空)
+# - compatible : 兼容模式(同时接受明文和密文)
+# - safe       : 安全模式(只接受密文,推荐生产使用)
+encrypt_mode = "plain"
+
+[evoclaw]
+# evoclaw 二进制路径。留空则默认在 PATH 中查找 "evoclaw"。
+binary = "evoclaw"
+
+# 传给 evoclaw channel run 的额外参数。一般不需要改。
+extra_args = []
+
+# 单条消息的总超时(毫秒)。微信硬超时是 5 秒,这里默认 4500 留 500ms 余量。
+timeout_ms = 4500
+
+# 子进程池大小。低流量场景用 1 即可;高并发场景增大此值。
+# 注意:每个子进程都是一个完整 evoclaw 实例,会占用内存。
+worker_count = 1
+
+[reply]
+# 超时或后端失败时返回的兜底文案。
+fallback = "我还在想这个问题,请换个简单的问法,或稍后再试一次。"
+
+# 用户首次关注公众号时回复(subscribe 事件)。留空则不回复。
+welcome = "您好!我是 AI 助手,直接发消息向我提问即可。"
+
+# 不识别的事件类型默认是否回复(关注/取关/菜单点击等)。
+# false = 静默;true = 用 reply.fallback 回复。
+echo_unknown_event = false
+
+[log]
+# trace | debug | info | warn | error
+level = "info"
