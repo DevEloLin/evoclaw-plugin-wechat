@@ -31,8 +31,19 @@ encrypt_mode = "plain"
 # evoclaw 二进制路径。留空则默认在 PATH 中查找 "evoclaw"。
 binary = "evoclaw"
 
-# 传给 evoclaw channel run 的额外参数。一般不需要改。
-extra_args = []
+# 传给 evoclaw channel run 的额外参数。
+# 推荐配置(WeChat 5s 窗口必备):
+#   --no-reflection : 跳过反思轮(省 1-3s)
+#   --no-tools      : 关掉所有工具,模型一次回答完(没有工具循环)
+#   --max-turns 1   : 配合 --no-tools 进一步硬卡死单轮
+#   --max-tokens 300: 回复短(WeChat 上限本来也是 ~2048 字节)
+# 这些 flag 在 EvoClaw 1.0.1-beta.1 之后的 channel run 子命令上提供。
+extra_args = [
+    "--no-reflection",
+    "--no-tools",
+    "--max-turns", "1",
+    "--max-tokens", "300",
+]
 
 # 单条消息的总超时(毫秒)。微信硬超时是 5 秒,这里默认 4500 留 500ms 余量。
 timeout_ms = 4500
