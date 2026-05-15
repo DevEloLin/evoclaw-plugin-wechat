@@ -139,14 +139,24 @@ WeChat user → WeChat server → POST https://bot.example.com/wechat
   # then `evoclaw doctor` to verify
   ```
 
-  Caveat: EvoClaw's `channel run` currently uses `RuntimeConfig::default()`,
-  which has `reflection_enabled = true`, `max_turns = 25`, and all
-  built-in tools registered. These cannot be overridden from config.toml
-  today. Reflection alone adds ~1-3s per request — most of the slack in
-  the 5s budget. If you hit frequent timeouts, ask upstream EvoClaw to
-  expose `--no-reflection --max-turns N` flags on `channel run`; the
-  plugin's `evoclaw.extra_args` config field is already wired to pass
-  them through.
+  On EvoClaw 1.0.1-beta.1+, also pass fast-mode flags via the plugin's
+  `evoclaw.extra_args` so the runtime actually fits inside 5 s:
+
+  ```toml
+  [evoclaw]
+  binary     = "evoclaw"
+  extra_args = [
+      "--no-reflection",   # skip the 1-3 s reflection round
+      "--no-tools",        # empty ToolRegistry — single-turn answers
+      "--max-turns", "1",  # hard-cap turns
+      "--max-tokens", "300",
+  ]
+  ```
+
+  Without these, every channel message pays for an extra reflection LLM
+  call (~1-3 s) and risks a tool-call loop, which together usually trip
+  the 5 s WeChat timeout. Run `evoclaw channel run --help` to confirm
+  the flags are available on your binary.
 
 ## Reliability features
 

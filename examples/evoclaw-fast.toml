@@ -19,27 +19,20 @@
 #     `deepseek-chat` typically replies in 1-2s; GPT-4o-mini is similar;
 #     Qwen Turbo even faster for short Chinese answers.
 #
-# What we CANNOT tune via this file today:
+# Other fast-mode knobs live on `evoclaw channel run` directly, not in
+# config.toml. The plugin's bridge passes them through via the
+# `[evoclaw] extra_args` field in ~/.evoclaw/plugins/wechat.toml:
 #
-#   * `max_turns`, `max_tokens`, `temperature`, `reflection_enabled` —
-#     these are `RuntimeConfig` fields baked into EvoClaw's defaults
-#     (25 turns / 4096 tokens / 0.2 / reflection ON). They cannot be
-#     overridden from config.toml in current EvoClaw. With reflection
-#     enabled, every channel message costs an extra ~1-3 second LLM
-#     round, which eats into the 5s WeChat budget.
+#   [evoclaw]
+#   extra_args = [
+#       "--no-reflection",   # skip the 1-3s reflection round
+#       "--no-tools",        # empty ToolRegistry, single-turn answers
+#       "--max-turns", "1",  # hard-cap turns
+#       "--max-tokens", "300",
+#   ]
 #
-#     If your replies frequently timeout, ask the EvoClaw maintainers
-#     to expose CLI flags on `evoclaw channel run` (e.g. `--no-reflection
-#     --max-turns 1`), then add them to `evoclaw.extra_args` in
-#     ~/.evoclaw/plugins/wechat.toml. Tracked as an upstream feature
-#     request; this plugin's bridge already passes `extra_args` through.
-#
-# What about tool calling?
-#
-#   `channel run` registers ALL built-in tools by default. A fast small
-#   model usually just answers in turn 1 for plain conversational input,
-#   but if your prompts encourage tool use (e.g. "search the web for…"),
-#   you'll trip the 5s budget. Keep the public-account persona simple.
+# Available on EvoClaw 1.0.1-beta.1 and later. Run
+# `evoclaw channel run --help` to confirm flags are present.
 
 [model]
 provider = "deepseek"
