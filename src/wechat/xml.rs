@@ -77,8 +77,8 @@ pub fn parse_inbound(xml: &str) -> Result<InboundXml> {
         .ok_or_else(|| PluginError::BadXml("missing <FromUserName>".into()))?;
     let create_time = take(&mut bag, "CreateTime")
         .ok_or_else(|| PluginError::BadXml("missing <CreateTime>".into()))?;
-    let msg_type = take(&mut bag, "MsgType")
-        .ok_or_else(|| PluginError::BadXml("missing <MsgType>".into()))?;
+    let msg_type =
+        take(&mut bag, "MsgType").ok_or_else(|| PluginError::BadXml("missing <MsgType>".into()))?;
     let content = take(&mut bag, "Content");
     let event = take(&mut bag, "Event");
     let event_key = take(&mut bag, "EventKey");

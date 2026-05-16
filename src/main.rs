@@ -35,7 +35,11 @@ const DEFAULT_CONFIG_HINT: &str = "~/.evoclaw/plugins/wechat.toml";
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Parser)]
-#[command(name = "evoclaw-plugin-wechat", version, about = "WeChat Official Account passive-reply bridge for EvoClaw")]
+#[command(
+    name = "evoclaw-plugin-wechat",
+    version,
+    about = "WeChat Official Account passive-reply bridge for EvoClaw"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -70,7 +74,10 @@ async fn main() -> eyre::Result<()> {
             let path = resolve_config_path(config)?;
             let cfg = Config::from_path(&path).await?;
             println!("✓ config valid: {}", path.display());
-            println!("  endpoint:     {}{}", cfg.server.bind, cfg.server.endpoint_path);
+            println!(
+                "  endpoint:     {}{}",
+                cfg.server.bind, cfg.server.endpoint_path
+            );
             println!("  encrypt_mode: {:?}", cfg.wechat.encrypt_mode);
             println!("  worker_count: {}", cfg.evoclaw.worker_count);
             println!("  timeout_ms:   {}", cfg.evoclaw.timeout_ms);
@@ -92,9 +99,12 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> eyre::Result<PathBuf> {
     if let Some(p) = explicit {
         return Ok(p);
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| eyre::eyre!("HOME not set and no --config given"))?;
-    let p = PathBuf::from(home).join(".evoclaw").join("plugins").join("wechat.toml");
+    let home =
+        std::env::var("HOME").map_err(|_| eyre::eyre!("HOME not set and no --config given"))?;
+    let p = PathBuf::from(home)
+        .join(".evoclaw")
+        .join("plugins")
+        .join("wechat.toml");
     if !p.exists() {
         eyre::bail!(
             "no config at {} (expected: {}). Pass --config <path> or run \

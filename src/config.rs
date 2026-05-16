@@ -548,12 +548,13 @@ impl Config {
             )));
         }
         if self.evoclaw.worker_count == 0 {
-            return Err(PluginError::Config("evoclaw.worker_count must be >= 1".into()));
+            return Err(PluginError::Config(
+                "evoclaw.worker_count must be >= 1".into(),
+            ));
         }
         if self.reply.max_chars == 0 {
             return Err(PluginError::Config(
-                "reply.max_chars must be >= 1 (recommended 600 for safe WeChat byte budget)"
-                    .into(),
+                "reply.max_chars must be >= 1 (recommended 600 for safe WeChat byte budget)".into(),
             ));
         }
 

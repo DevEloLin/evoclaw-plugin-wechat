@@ -115,7 +115,9 @@ fn render_title(cfg: &RouterCfg, filter: &EventFilter, count: usize) -> String {
 /// Returns empty string for `None` / `DateTag::All` so the template
 /// renders cleanly without an "All UAE has 3 events" prefix.
 fn date_label(date: Option<DateTag>, cfg: &RouterCfg) -> &str {
-    let Some(d) = date else { return ""; };
+    let Some(d) = date else {
+        return "";
+    };
     let labels = &cfg.news_card.date_labels;
     match d {
         DateTag::Today => &labels.today,
@@ -290,10 +292,7 @@ mod tests {
     #[test]
     fn events_with_empty_query_returns_empty_template() {
         const DAYS_COVERED: u32 = 7;
-        let snap = snap_with(
-            vec![evt("a", "A", Some(CITY_SHARJAH), None)],
-            DAYS_COVERED,
-        );
+        let snap = snap_with(vec![evt("a", "A", Some(CITY_SHARJAH), None)], DAYS_COVERED);
         let f = EventFilter {
             city: Some(CITY_NO_MATCH.into()),
             ..Default::default()
@@ -329,7 +328,11 @@ mod tests {
         match r {
             Reply::News(n) => {
                 assert!(n.title.contains(CITY_DUBAI));
-                assert!(n.title.contains("2"), "title should include count: {}", n.title);
+                assert!(
+                    n.title.contains("2"),
+                    "title should include count: {}",
+                    n.title
+                );
                 assert!(n.description.contains(ART_TITLE));
                 assert!(n.description.contains(MUSIC_TITLE));
                 assert_eq!(n.pic_url, TEST_PIC_URL);
@@ -429,9 +432,27 @@ mod tests {
         // skip Nepal.
         let snap = snap_with(
             vec![
-                evt_in("t1", "Istanbul Art Week", COUNTRY_TURKEY, Some(CITY_ISTANBUL), Some(CATEGORY_ART)),
-                evt_in("t2", "Cappadocia Music Festival", COUNTRY_TURKEY, None, Some(CATEGORY_MUSIC)),
-                evt_in("n1", "Kathmandu Art Show", COUNTRY_NEPAL, Some(CITY_KATHMANDU), Some(CATEGORY_ART)),
+                evt_in(
+                    "t1",
+                    "Istanbul Art Week",
+                    COUNTRY_TURKEY,
+                    Some(CITY_ISTANBUL),
+                    Some(CATEGORY_ART),
+                ),
+                evt_in(
+                    "t2",
+                    "Cappadocia Music Festival",
+                    COUNTRY_TURKEY,
+                    None,
+                    Some(CATEGORY_MUSIC),
+                ),
+                evt_in(
+                    "n1",
+                    "Kathmandu Art Show",
+                    COUNTRY_NEPAL,
+                    Some(CITY_KATHMANDU),
+                    Some(CATEGORY_ART),
+                ),
             ],
             7,
         );
@@ -457,7 +478,13 @@ mod tests {
         // right country but no matching city, so it's excluded.
         let snap = snap_with(
             vec![
-                evt_in("a", "Istanbul Art", COUNTRY_TURKEY, Some(CITY_ISTANBUL), None),
+                evt_in(
+                    "a",
+                    "Istanbul Art",
+                    COUNTRY_TURKEY,
+                    Some(CITY_ISTANBUL),
+                    None,
+                ),
                 evt_in("b", "Cappadocia Music", COUNTRY_TURKEY, None, None),
             ],
             7,

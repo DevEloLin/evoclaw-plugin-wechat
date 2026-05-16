@@ -118,11 +118,8 @@ impl AiClassifier {
                 return Intent::unknown();
             }
         };
-        let result = tokio::time::timeout(
-            self.timeout,
-            bridge.ask("intent-classifier", &prompt),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(self.timeout, bridge.ask("intent-classifier", &prompt)).await;
         let raw = match result {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
@@ -130,8 +127,10 @@ impl AiClassifier {
                 return Intent::unknown();
             }
             Err(_) => {
-                tracing::warn!(timeout_ms = self.timeout.as_millis() as u64,
-                    "intent: AI classification timed out");
+                tracing::warn!(
+                    timeout_ms = self.timeout.as_millis() as u64,
+                    "intent: AI classification timed out"
+                );
                 return Intent::unknown();
             }
         };
