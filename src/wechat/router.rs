@@ -82,9 +82,25 @@ fn build_events_reply(intent: &Intent, snap: &DigestSnapshot, cfg: &RouterCfg) -
 }
 
 fn render_title(cfg: &RouterCfg, filter: &EventFilter, count: usize) -> String {
+    // Order of substitution is irrelevant — placeholders never contain
+    // each other's tokens (`{city}` text never appears inside `{count}`'s
+    // value etc.) so the chain is associative. Templates that omit a
+    // placeholder simply leave it unfilled. The whole point of having
+    // 3 independent scope dimensions ({country}, {city}, {date}) is so
+    // operators can compose whichever subset their template needs:
+    //   - single-country UAE deployment: "{date}{city}有 {count} 场"
+    //   - multi-country digest:          "{date}{country}{city}有 {count} 场"
+    //   - country-only no cities:        "{country}近期 {count} 个活动"
     cfg.news_card
         .title_template
         .replace("{count}", &count.to_string())
+        .replace(
+            "{country}",
+            filter
+                .country
+                .as_deref()
+                .unwrap_or(&cfg.news_card.default_country_label),
+        )
         .replace(
             "{city}",
             filter
@@ -150,9 +166,14 @@ mod tests {
     // Canonical city/category tags. MUST match the values our tests
     // sprinkle into Event::city / Event::category — that's the whole
     // point of canonical-tag matching. Changes here propagate.
+    const COUNTRY_UAE: &str = "UAE";
+    const COUNTRY_TURKEY: &str = "Turkey";
+    const COUNTRY_NEPAL: &str = "Nepal";
     const CITY_DUBAI: &str = "Dubai";
     const CITY_ABU_DHABI: &str = "AbuDhabi";
     const CITY_SHARJAH: &str = "Sharjah";
+    const CITY_ISTANBUL: &str = "Istanbul";
+    const CITY_KATHMANDU: &str = "Kathmandu";
     const CITY_NO_MATCH: &str = "Mars"; // intentionally absent from fixtures
     const CATEGORY_ART: &str = "art";
     const CATEGORY_MUSIC: &str = "music";
@@ -185,7 +206,8 @@ mod tests {
                 title_template: TEST_TITLE_TEMPLATE.into(),
                 description_separator: TEST_DESC_SEPARATOR.into(),
                 description_max_chars: TEST_DESC_MAX_CHARS,
-                default_city_label: "UAE".into(),
+                default_city_label: COUNTRY_UAE.into(),
+                default_country_label: String::new(),
                 date_labels: DateLabelsCfg::default(),
             },
         }
@@ -206,6 +228,7 @@ mod tests {
             id: id.into(),
             title: title.into(),
             description: "".into(),
+            country: None,
             city: city.map(String::from),
             category: category.map(String::from),
             date_start: None,
@@ -214,6 +237,22 @@ mod tests {
             venue: None,
             url: None,
             image_url: None,
+        }
+    }
+
+    /// Variant that also sets the canonical country tag — needed by
+    /// multi-country routing tests so events have the country
+    /// dimension to filter on.
+    fn evt_in(
+        id: &str,
+        title: &str,
+        country: &str,
+        city: Option<&str>,
+        category: Option<&str>,
+    ) -> Event {
+        Event {
+            country: Some(country.into()),
+            ..evt(id, title, city, category)
         }
     }
 
@@ -389,5 +428,99 @@ mod tests {
         let title = render_title(&cfg, &EventFilter::default(), 7);
         assert!(title.contains("全境"), "got: {title}");
         assert!(!title.contains("UAE"), "default label leaked: {title}");
+    }
+
+    // ---- Multi-country routing ----
+
+    #[test]
+    fn country_only_filter_matches_events_anywhere_in_country() {
+        // Three events in Turkey (two cities) + one in Nepal.
+        // Filter by country=Turkey → must return both Turkey events,
+        // skip Nepal.
+        let snap = snap_with(
+            vec![
+                evt_in("t1", "Istanbul Art Week", COUNTRY_TURKEY, Some(CITY_ISTANBUL), Some(CATEGORY_ART)),
+                evt_in("t2", "Cappadocia Music Festival", COUNTRY_TURKEY, None, Some(CATEGORY_MUSIC)),
+                evt_in("n1", "Kathmandu Art Show", COUNTRY_NEPAL, Some(CITY_KATHMANDU), Some(CATEGORY_ART)),
+            ],
+            7,
+        );
+        let f = EventFilter {
+            country: Some(COUNTRY_TURKEY.into()),
+            ..Default::default()
+        };
+        let r = route(&Intent::events(f), Some(snap), &cfg_with_news_card());
+        match r {
+            Reply::News(n) => {
+                assert!(n.description.contains("Istanbul"));
+                assert!(n.description.contains("Cappadocia"));
+                assert!(!n.description.contains("Kathmandu"));
+            }
+            other => panic!("expected News, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn country_and_city_anded_in_filter() {
+        // Filter country=Turkey AND city=Istanbul. Only the event
+        // tagged with BOTH must match — the Cappadocia event has the
+        // right country but no matching city, so it's excluded.
+        let snap = snap_with(
+            vec![
+                evt_in("a", "Istanbul Art", COUNTRY_TURKEY, Some(CITY_ISTANBUL), None),
+                evt_in("b", "Cappadocia Music", COUNTRY_TURKEY, None, None),
+            ],
+            7,
+        );
+        let f = EventFilter {
+            country: Some(COUNTRY_TURKEY.into()),
+            city: Some(CITY_ISTANBUL.into()),
+            ..Default::default()
+        };
+        let r = route(&Intent::events(f), Some(snap), &cfg_with_news_card());
+        match r {
+            Reply::News(n) => {
+                assert!(n.description.contains("Istanbul Art"));
+                assert!(!n.description.contains("Cappadocia"));
+            }
+            other => panic!("expected News, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn title_country_placeholder_substitutes_from_filter() {
+        let mut cfg = cfg_with_news_card();
+        cfg.news_card.title_template = "{date}{country}{city}{count}".into();
+        let f = EventFilter {
+            country: Some(COUNTRY_TURKEY.into()),
+            city: Some(CITY_ISTANBUL.into()),
+            ..Default::default()
+        };
+        let title = render_title(&cfg, &f, 5);
+        assert!(title.contains(COUNTRY_TURKEY));
+        assert!(title.contains(CITY_ISTANBUL));
+        assert!(title.contains("5"));
+    }
+
+    #[test]
+    fn title_country_falls_back_to_default_label() {
+        let mut cfg = cfg_with_news_card();
+        cfg.news_card.title_template = "{country} has {count}".into();
+        cfg.news_card.default_country_label = "全球".into();
+        let title = render_title(&cfg, &EventFilter::default(), 9);
+        assert!(title.contains("全球"));
+        assert!(title.contains("9"));
+    }
+
+    #[test]
+    fn default_country_label_is_config_driven_not_hardcoded() {
+        // Lock down that no "UAE" / "Worldwide" / any country name
+        // leaks from code: an empty default label leaves the
+        // placeholder rendered as empty string.
+        let mut cfg = cfg_with_news_card();
+        cfg.news_card.title_template = "<{country}>".into();
+        cfg.news_card.default_country_label = String::new();
+        let title = render_title(&cfg, &EventFilter::default(), 1);
+        assert_eq!(title, "<>");
     }
 }

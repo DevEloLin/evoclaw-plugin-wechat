@@ -541,6 +541,87 @@ v0.1 没有 Prometheus `/metrics`,没有 OTel。如果需要请求延迟 / fallb
 
 ---
 
+## 多国场景配置
+
+插件本身不绑定任何特定国家——所有"国家 / 城市 / 类别"知识都在
+`wechat.toml` 的 `[intent.dict]` 里。要扩展到新国家(如新增土耳其、
+尼泊尔),走以下三步:
+
+### 1. 在 `intent.dict.countries` 加该国
+
+```toml
+[[intent.dict.countries]]
+words = ["土耳其", "Turkey", "turkey", "TR"]
+tag   = "Turkey"
+
+[[intent.dict.countries]]
+words = ["尼泊尔", "Nepal", "nepal", "NP"]
+tag   = "Nepal"
+```
+
+`tag` 是 **canonical 字符串**,后续 digest 数据里的 `country` 字段
+必须用这个值才能匹配上。
+
+### 2. 在 `intent.dict.cities` 加该国的城市
+
+```toml
+[[intent.dict.cities]]
+words = ["伊斯坦布尔", "Istanbul", "IST"]
+tag   = "Istanbul"
+
+[[intent.dict.cities]]
+words = ["加德满都", "Kathmandu", "KTM"]
+tag   = "Kathmandu"
+```
+
+国家和城市维度是**独立的**——用户可以问:
+- "土耳其活动"      → `country=Turkey` (city 留空)
+- "伊斯坦布尔活动"  → `city=Istanbul` (country 留空)
+- "土耳其伊斯坦布尔活动" → 两者都填,filter 取交集
+
+### 3. 在 skill 端给每条 event 打 country 标签
+
+`data.json` 的 schema 现在有 `country` 字段:
+
+```json
+{
+  "version": 1,
+  "events": [
+    {
+      "id": "ist-2026-art",
+      "title": "Istanbul Art Week",
+      "country": "Turkey",
+      "city": "Istanbul",
+      "category": "art",
+      ...
+    }
+  ]
+}
+```
+
+`country` 必须与 `intent.dict.countries[].tag` **完全一致**(大小写敏感)。
+
+### 4. 视情况调标题模板
+
+如果你做了多国 digest,标题里加上 `{country}` 才能区分。`wechat.toml`:
+
+```toml
+[router.news_card]
+title_template = "{date}{country}{city}有 {count} 场活动"
+```
+
+效果:
+- 用户问"今天土耳其活动" → "今天 Turkey 有 3 场活动"
+- 用户问"今天迪拜活动"   → "今天 Dubai 有 5 场活动"(country 留空,被 default_country_label 替换)
+- 用户问"今天活动"       → 两个 default 都生效
+
+用 `default_country_label` / `default_city_label` 控制留空时的回退文案。
+
+### 一个完整的多国 wechat.toml 模板
+
+见 `config.example.toml`,已经包含 UAE + Turkey + Nepal 的最小 dict 配置。
+所有维度都可以无限扩展,**插件代码不需要任何改动**。
+
 ## 已知限制
 
 | 限制 | 状态 |

@@ -106,8 +106,9 @@ ai_prompt_override = ""
 
 [intent.dict]
 help_words   = ["菜单", "help", "?", "帮助"]
-action_words = ["活动", "玩的", "节目", "推荐", "去处", "event"]
+action_words = ["活动", "玩的", "节目", "推荐", "去处", "event", "攻略"]
 
+# ----- 日期(date)维度
 [[intent.dict.dates]]
 words = ["今天", "今日", "今晚", "today", "tonight"]
 tag   = "today"
@@ -120,6 +121,24 @@ tag   = "tomorrow"
 words = ["周末", "this weekend", "本周末", "周六", "周日"]
 tag   = "weekend"
 
+# ----- 国家(country)维度 — 多国场景的关键
+# Skills 把每条活动打上 country 标签写到 digest;插件按这里的词典
+# 把用户输入的"土耳其/Turkey"映射到 canonical "Turkey"。可以无限加。
+[[intent.dict.countries]]
+words = ["阿联酋", "UAE", "uae"]
+tag   = "UAE"
+
+[[intent.dict.countries]]
+words = ["土耳其", "Turkey", "turkey", "TR"]
+tag   = "Turkey"
+
+[[intent.dict.countries]]
+words = ["尼泊尔", "Nepal", "nepal", "NP"]
+tag   = "Nepal"
+
+# ----- 城市(city)维度
+# 城市标签独立于国家。用户可以问"伊斯坦布尔活动"(city only)、
+# "土耳其活动"(country only)、或者"土耳其伊斯坦布尔活动"(both)。
 [[intent.dict.cities]]
 words = ["迪拜", "Dubai", "DXB"]
 tag   = "Dubai"
@@ -132,6 +151,23 @@ tag   = "AbuDhabi"
 words = ["沙迦", "Sharjah", "SHJ"]
 tag   = "Sharjah"
 
+[[intent.dict.cities]]
+words = ["伊斯坦布尔", "Istanbul", "IST"]
+tag   = "Istanbul"
+
+[[intent.dict.cities]]
+words = ["安卡拉", "Ankara"]
+tag   = "Ankara"
+
+[[intent.dict.cities]]
+words = ["加德满都", "Kathmandu", "KTM"]
+tag   = "Kathmandu"
+
+[[intent.dict.cities]]
+words = ["博卡拉", "Pokhara"]
+tag   = "Pokhara"
+
+# ----- 类别(category)维度 — 也完全用户提供,加任何垂直都行
 [[intent.dict.categories]]
 words = ["艺术", "展览", "art", "exhibition", "gallery"]
 tag   = "art"
@@ -166,12 +202,25 @@ events_in_card    = 3
 [router.news_card]
 pic_url  = ""
 url      = ""
-title_template        = "{date}{city}有 {count} 场活动"
+# 模板支持 4 个占位符:{count} {date} {country} {city}
+# 单国场景 (例:只服务 UAE):
+#   title_template = "{date}{city}有 {count} 场活动"
+#   default_city_label = "全境"
+# 多国场景 (UAE + 土耳其 + 尼泊尔 等):
+#   title_template = "{date}{country}{city}有 {count} 场活动"
+#   default_country_label = "" (留空让 {country} 不出现在标题里当用户没指定国家)
+#   default_city_label = ""
+title_template        = "{date}{country}{city}有 {count} 场活动"
 description_separator = " · "
 description_max_chars = 80
-# 用户没指定城市时 {city} 替换成的字符串。可改成"全境"、"all of UAE"、品牌
-# 名等。留空字符串就让 {city} 渲染为空。
-default_city_label = "UAE"
+
+# 用户没指定城市时 {city} 替换成的字符串。留空字符串就让 {city} 渲染为空。
+# 单国场景常填"全境"、"all of UAE";多国场景一般留空。
+default_city_label = ""
+
+# 用户没指定国家时 {country} 替换成的字符串。留空 = 不显示。
+# 想做全球性 "Worldwide" / "全球" 兜底语就填,不想就留空。
+default_country_label = ""
 
 # 各 DateTag 的用户可见字符串。全部可自定义,改成英文 / 任意语言皆可。
 [router.news_card.date_labels]

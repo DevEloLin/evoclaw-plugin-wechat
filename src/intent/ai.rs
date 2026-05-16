@@ -22,31 +22,40 @@ use crate::intent::{parse_date_tag, Intent, IntentKind};
 use serde::Deserialize;
 use std::time::Duration;
 
-/// Default system prompt. The model gets the user's message after this
-/// block and must output ONLY a JSON object matching the documented
-/// schema. Anything else (markdown fences, leading prose) is tolerated
-/// by [`extract_json`] below.
-pub const DEFAULT_PROMPT: &str = r#"You are an intent classifier for a UAE-events chatbot.
-Output a STRICT JSON object, nothing else (no markdown fences, no commentary).
+/// Default system prompt — deliberately **vertical-agnostic and
+/// country-agnostic**. The classifier outputs free-form values for
+/// `country` / `city` / `category` (whatever the user typed); the
+/// router validates those against the operator's canonical tag table
+/// downstream. Unknown values just fail to match any events and the
+/// user gets `empty_result_template`. This keeps the prompt short
+/// (faster LLM round-trip) and lets the operator add Turkey / Nepal
+/// / anywhere without editing this string.
+///
+/// Operators who want a tighter prompt (constrained enums) can supply
+/// their own via `intent.ai_prompt_override` in config. The
+/// `{msg}` placeholder is the only thing this code substitutes.
+pub const DEFAULT_PROMPT: &str = r#"You are an intent classifier for a chatbot.
+Output a STRICT JSON object only — no markdown fences, no commentary.
 
 Schema:
 {
   "kind": "help" | "events" | "general_qa" | "unknown",
   "filter": {
     "date":        "today" | "tomorrow" | "weekend" | "week" | "all" | null,
-    "city":        "Dubai" | "AbuDhabi" | "Sharjah" | null,
-    "category":    "art" | "music" | "food" | "family" | "free" | null,
+    "country":     <string or null>,
+    "city":        <string or null>,
+    "category":    <string or null>,
     "time_of_day": "morning" | "afternoon" | "evening" | null
   }
 }
 
 Rules:
-- "kind": "help" iff the user wants the menu / instructions.
-- "kind": "events" iff the user asks WHAT IS HAPPENING (in UAE, by city, by category, by date).
+- "kind": "help" iff the user explicitly wants the menu / instructions.
+- "kind": "events" iff the user asks WHAT IS HAPPENING / what to do / events / activities / things to see.
 - "kind": "general_qa" for any other question (weather, factual lookup, conversation).
 - "kind": "unknown" only if the message is too short/garbled to classify.
-- "filter": every field is OPTIONAL. Use null when the user did not specify that dimension.
-- DO NOT invent values outside the enumerated lists.
+- For country / city / category: copy the user's surface form into the field, or use null if not mentioned. Downstream code maps to canonical tags.
+- "date" / "time_of_day": pick from the enumerated values, or null.
 
 User message: {msg}"#;
 
@@ -62,6 +71,8 @@ struct RawIntent {
 struct RawFilter {
     #[serde(default)]
     date: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
     #[serde(default)]
     city: Option<String>,
     #[serde(default)]
@@ -184,6 +195,7 @@ fn raw_to_intent(r: RawIntent) -> Intent {
     };
     let filter = EventFilter {
         date: r.filter.date.as_deref().and_then(parse_date_tag),
+        country: r.filter.country.filter(|s| !s.trim().is_empty()),
         city: r.filter.city.filter(|s| !s.trim().is_empty()),
         category: r.filter.category.filter(|s| !s.trim().is_empty()),
         time_of_day: r.filter.time_of_day.filter(|s| !s.trim().is_empty()),
@@ -264,6 +276,23 @@ mod tests {
         let raw = r#"prefix {"kind":"events","filter":{"city":"Dubai {City}"}} suffix"#;
         let i = parse_intent(raw).unwrap();
         assert_eq!(i.filter.city.as_deref(), Some("Dubai {City}"));
+    }
+
+    #[test]
+    fn parses_country_field() {
+        let raw = r#"{"kind":"events","filter":{"country":"Turkey","city":"Istanbul"}}"#;
+        let i = parse_intent(raw).unwrap();
+        assert_eq!(i.kind, IntentKind::Events);
+        assert_eq!(i.filter.country.as_deref(), Some("Turkey"));
+        assert_eq!(i.filter.city.as_deref(), Some("Istanbul"));
+    }
+
+    #[test]
+    fn empty_country_string_treated_as_none() {
+        let raw = r#"{"kind":"events","filter":{"country":"","city":"Kathmandu"}}"#;
+        let i = parse_intent(raw).unwrap();
+        assert!(i.filter.country.is_none());
+        assert_eq!(i.filter.city.as_deref(), Some("Kathmandu"));
     }
 
     #[test]

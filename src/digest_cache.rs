@@ -61,6 +61,13 @@ pub struct DigestData {
 /// schema so the skill author has a canonical place to look and (b)
 /// give future card variants more material without a wire-format
 /// change. Removing any of them would be a breaking schema change.
+///
+/// **All "scope" fields (`country`, `city`, `category`, `time_of_day`)
+/// are free-form `Option<String>` whose values MUST exactly match the
+/// canonical tags in the operator's `intent.dict.*` config**. The
+/// plugin does no fuzzy matching at filter time — the dictionary's
+/// surface-form-to-tag mapping is the only place fuzziness lives. This
+/// keeps the per-request filter cost O(events).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Event {
@@ -68,13 +75,16 @@ pub struct Event {
     pub title: String,
     #[serde(default)]
     pub description: String,
-    /// Canonical city tag. MUST match values in
-    /// `intent.dict.cities[].tag` exactly (case-sensitive) for the
-    /// filter to match — that's the whole point of the canonical tag
-    /// system, no fuzzy matching here.
+    /// Canonical country tag (e.g. "UAE", "Turkey", "Nepal"). Used for
+    /// multi-country digests where one skill aggregates regional events
+    /// across many countries; single-country deployments can leave this
+    /// empty and just use `city`.
+    #[serde(default)]
+    pub country: Option<String>,
+    /// Canonical city tag.
     #[serde(default)]
     pub city: Option<String>,
-    /// Canonical category tag — same as `city`.
+    /// Canonical category tag.
     #[serde(default)]
     pub category: Option<String>,
     /// First day the event is open (YYYY-MM-DD).
@@ -111,6 +121,10 @@ pub struct DigestSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct EventFilter {
     pub date: Option<DateTag>,
+    /// Canonical country tag. Use this dimension when the user names
+    /// a country directly ("土耳其活动") or when a city tag's resolver
+    /// also wants to scope by the country it belongs to.
+    pub country: Option<String>,
     pub city: Option<String>,
     pub category: Option<String>,
     pub time_of_day: Option<String>,
@@ -294,6 +308,11 @@ fn matches_filter(
     f: &EventFilter,
     date_range: Option<&(chrono::NaiveDate, chrono::NaiveDate)>,
 ) -> bool {
+    if let Some(country) = &f.country {
+        if e.country.as_deref() != Some(country.as_str()) {
+            return false;
+        }
+    }
     if let Some(city) = &f.city {
         if e.city.as_deref() != Some(city.as_str()) {
             return false;
@@ -385,8 +404,13 @@ mod tests {
     const TMP_PREFIX: &str = "evo-digest-cache-";
     const TEST_GENERATED_AT: &str = "2026-05-16T00:00:00Z";
 
+    const COUNTRY_UAE: &str = "UAE";
+    const COUNTRY_TURKEY: &str = "Turkey";
+    const COUNTRY_NEPAL: &str = "Nepal";
     const CITY_DUBAI: &str = "Dubai";
     const CITY_ABU_DHABI: &str = "AbuDhabi";
+    const CITY_ISTANBUL: &str = "Istanbul";
+    const CITY_KATHMANDU: &str = "Kathmandu";
     const CATEGORY_ART: &str = "art";
     const CATEGORY_MUSIC: &str = "music";
 
@@ -425,6 +449,7 @@ mod tests {
             id: id.into(),
             title: title.into(),
             description: String::new(),
+            country: None,
             city: None,
             category: None,
             date_start: None,
@@ -577,6 +602,61 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(hits.len(), LIMIT);
+    }
+
+    #[test]
+    fn query_filters_by_country() {
+        let snap = mk_snapshot(vec![
+            Event {
+                country: Some(COUNTRY_UAE.into()),
+                city: Some(CITY_DUBAI.into()),
+                ..mk_event("a", "UAE Event")
+            },
+            Event {
+                country: Some(COUNTRY_TURKEY.into()),
+                city: Some(CITY_ISTANBUL.into()),
+                ..mk_event("b", "Turkey Event")
+            },
+            Event {
+                country: Some(COUNTRY_NEPAL.into()),
+                city: Some(CITY_KATHMANDU.into()),
+                ..mk_event("c", "Nepal Event")
+            },
+        ]);
+        let f = EventFilter {
+            country: Some(COUNTRY_TURKEY.into()),
+            ..Default::default()
+        };
+        let hits = snap.query(&f);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "b");
+    }
+
+    #[test]
+    fn query_country_and_city_anded() {
+        let snap = mk_snapshot(vec![
+            Event {
+                country: Some(COUNTRY_TURKEY.into()),
+                city: Some(CITY_ISTANBUL.into()),
+                ..mk_event("a", "Istanbul")
+            },
+            Event {
+                country: Some(COUNTRY_TURKEY.into()),
+                city: None, // country-only event (e.g. nationwide festival)
+                ..mk_event("b", "Nationwide")
+            },
+        ]);
+        // Filter country=Turkey AND city=Istanbul: only the Istanbul
+        // event matches, the country-only one is filtered out because
+        // the user explicitly asked for a city.
+        let f = EventFilter {
+            country: Some(COUNTRY_TURKEY.into()),
+            city: Some(CITY_ISTANBUL.into()),
+            ..Default::default()
+        };
+        let hits = snap.query(&f);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "a");
     }
 
     #[test]
