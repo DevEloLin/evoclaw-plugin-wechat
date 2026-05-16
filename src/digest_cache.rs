@@ -303,6 +303,29 @@ impl DigestSnapshot {
     }
 }
 
+/// Decide whether one digest event matches a query filter.
+///
+/// Per-dimension None semantics(important — not consistent across all
+/// dimensions, this is by design):
+///
+/// | Filter field   | If filter is `None`           | If event field is `None`              |
+/// |----------------|-------------------------------|---------------------------------------|
+/// | `country`      | wildcard (matches anything)   | **strict**: never matches a non-None  |
+/// | `city`         | wildcard                      | **strict**: never matches a non-None  |
+/// | `category`     | wildcard                      | **strict**: never matches a non-None  |
+/// | `time_of_day`  | wildcard                      | **permissive**: matches any time      |
+/// | `date`         | wildcard                      | **strict**: undated events excluded   |
+///
+/// Why `time_of_day` is the odd one out: an event without
+/// `time_of_day` is taken to mean "happens all day" / "spans the whole
+/// day", so it should surface for any time-of-day query. Country / city
+/// / category, by contrast, default to strict — if the operator left an
+/// event's `country` blank, they probably didn't classify it yet, and
+/// surfacing it for country queries would feed bad data.
+///
+/// Skills that need "country-wide event also surfaces for city queries
+/// in that country" should encode that by duplicating the event per
+/// major city, or by tagging the event with a representative city.
 fn matches_filter(
     e: &Event,
     f: &EventFilter,
@@ -340,12 +363,24 @@ fn matches_filter(
         let end = e
             .date_end
             .as_deref()
-            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-            .or(start);
-        // Event must overlap [from, to].
-        let (Some(s), Some(en)) = (start, end) else {
-            return false; // event without dates can't match a date filter
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+        // Coerce single-end events into single-day events so they
+        // remain visible to date filters. Concrete table:
+        //   (start=Some, end=Some) → use as-is
+        //   (start=Some, end=None) → single-day at start
+        //   (start=None, end=Some) → single-day at end (e.g. "deadline
+        //                            event" — skill knows the end but
+        //                            not when it began)
+        //   (start=None, end=None) → not date-typed; excluded from
+        //                            date-filtered queries (strict;
+        //                            see docstring above)
+        let (s, en) = match (start, end) {
+            (Some(s), Some(e)) => (s, e),
+            (Some(s), None) => (s, s),
+            (None, Some(e)) => (e, e),
+            (None, None) => return false,
         };
+        // Event interval [s, en] must overlap filter interval [from, to].
         if en < *from || s > *to {
             return false;
         }
@@ -630,6 +665,52 @@ mod tests {
         let hits = snap.query(&f);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "b");
+    }
+
+    #[test]
+    fn query_date_filter_includes_event_with_only_date_end() {
+        // Regression: events written with `date_end` only (no
+        // `date_start`) used to be silently excluded from every
+        // date-filtered query because the early-exit `(Some, Some)`
+        // match failed. Now they're treated as single-day events
+        // anchored at `date_end`.
+        let today = chrono::Local::now().date_naive();
+        let today_str = today.format("%Y-%m-%d").to_string();
+        let snap = mk_snapshot(vec![Event {
+            date_end: Some(today_str),
+            ..mk_event("end-only", "End-only event")
+        }]);
+        let f = EventFilter {
+            date: Some(DateTag::Today),
+            ..Default::default()
+        };
+        let hits = snap.query(&f);
+        assert_eq!(hits.len(), 1, "date_end-only event must match today");
+    }
+
+    #[test]
+    fn query_date_filter_includes_event_with_only_date_start() {
+        let today = chrono::Local::now().date_naive();
+        let today_str = today.format("%Y-%m-%d").to_string();
+        let snap = mk_snapshot(vec![Event {
+            date_start: Some(today_str),
+            ..mk_event("start-only", "Start-only event")
+        }]);
+        let f = EventFilter {
+            date: Some(DateTag::Today),
+            ..Default::default()
+        };
+        assert_eq!(snap.query(&f).len(), 1);
+    }
+
+    #[test]
+    fn query_date_filter_excludes_event_with_no_dates() {
+        let snap = mk_snapshot(vec![mk_event("undated", "Undated event")]);
+        let f = EventFilter {
+            date: Some(DateTag::Today),
+            ..Default::default()
+        };
+        assert!(snap.query(&f).is_empty(), "undated event must NOT surface");
     }
 
     #[test]

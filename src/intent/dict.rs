@@ -56,15 +56,52 @@ pub fn classify(user_msg: &str, dict: &IntentDictCfg) -> Option<Intent> {
 fn contains_any(haystack_lower: &str, words: &[String]) -> bool {
     words
         .iter()
-        .any(|w| !w.is_empty() && haystack_lower.contains(&w.to_lowercase()))
+        .any(|w| word_matches(haystack_lower, &w.to_lowercase()))
 }
 
-/// First tag whose words list has any substring in `haystack_lower`.
-/// Returns `None` if no tag matches. Iteration order matches the config
-/// order, so authors can put more specific tags first (e.g. "今晚" in a
-/// `time_of_day=Evening` list ahead of "今天" → `date=Today` would
-/// resolve correctly since they're in different dimensions, but the
-/// principle is general).
+/// True if `word_lower` appears in `haystack_lower` using the
+/// dimension-appropriate matching rule:
+///
+/// * **Non-ASCII word** (CJK, Arabic, etc.) → naive substring match.
+///   These scripts don't have whitespace word boundaries; a Chinese
+///   character is its own token, so `"艺术".contains_in("今天艺术展")`
+///   = true is correct and unambiguous.
+/// * **ASCII word** → word-boundary check. Prevents false positives
+///   like dictionary word `"art"` matching inside `"smart"`, `"party"`,
+///   or `"start"`. A "boundary" here means: the surrounding character
+///   (or string edge) is NOT ASCII-alphanumeric, which correctly treats
+///   spaces, punctuation, and mid-string CJK as separators.
+fn word_matches(haystack_lower: &str, word_lower: &str) -> bool {
+    if word_lower.is_empty() {
+        return false;
+    }
+    if !word_lower.is_ascii() {
+        return haystack_lower.contains(word_lower);
+    }
+    let bytes = haystack_lower.as_bytes();
+    let needle = word_lower.as_bytes();
+    let n = needle.len();
+    if n > bytes.len() {
+        return false;
+    }
+    for i in 0..=bytes.len() - n {
+        if &bytes[i..i + n] == needle {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after_idx = i + n;
+            let after_ok =
+                after_idx == bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// First tag whose words list has any (rule-aware) match in
+/// `haystack_lower`. Returns `None` if no tag matches. Iteration order
+/// matches the config order, so authors can put more specific tags
+/// first when surface forms overlap.
 fn pick_tag(haystack_lower: &str, tags: &[TagWords]) -> Option<String> {
     tags.iter()
         .find(|t| contains_any(haystack_lower, &t.words))
@@ -221,5 +258,70 @@ mod tests {
         let mut d = sample_dict();
         d.action_words.push("".into());
         assert!(classify("hello world", &d).is_none());
+    }
+
+    // ----- word-boundary semantics for ASCII dictionary words --------
+
+    #[test]
+    fn ascii_word_does_not_match_inside_longer_english_word() {
+        // Regression: dictionary word "art" used to false-positive
+        // inside "smart", "party", "start" etc. Word-boundary check
+        // now prevents this.
+        let mut d = sample_dict();
+        // Use dict that only has "art" as category, no Chinese form,
+        // so the message must boundary-match "art" to get a category.
+        d.categories = vec![tw(&["art"], TAG_CAT_ART)];
+        let r = classify("smart event recommendation", &d).unwrap();
+        assert_eq!(r.kind, crate::intent::IntentKind::Events);
+        // "smart" must NOT match the dictionary word "art" — category
+        // stays None.
+        assert!(
+            r.filter.category.is_none(),
+            "leaked false-positive: {:?}",
+            r.filter.category
+        );
+    }
+
+    #[test]
+    fn ascii_word_matches_at_real_word_boundary() {
+        let mut d = sample_dict();
+        d.categories = vec![tw(&["art"], TAG_CAT_ART)];
+        // Real word boundaries: space, punctuation, end-of-string.
+        for msg in [
+            "I love art event",       // space before, space after
+            "an art event",           // surrounded by spaces
+            "Any art-related event?", // hyphen counts as boundary
+            "the event is art",       // end-of-string after
+            "art event for kids",     // start-of-string before
+        ] {
+            let r = classify(msg, &d).unwrap_or_else(|| panic!("dict missed: {msg}"));
+            assert_eq!(
+                r.filter.category.as_deref(),
+                Some(TAG_CAT_ART),
+                "should match 'art' as standalone word in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn cjk_word_still_matches_as_substring() {
+        // Regression-guard: CJK words have no whitespace word
+        // boundaries, so substring matching is the only sensible rule.
+        // Word-boundary check must NOT apply to non-ASCII words.
+        let r = classify("今天艺术展览有意思的活动", &sample_dict()).unwrap();
+        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
+    }
+
+    #[test]
+    fn mixed_chinese_english_word_boundaries() {
+        // Hybrid: English word "art" inside text with CJK surroundings.
+        // The CJK characters count as non-alphanumeric boundaries, so
+        // "art" surrounded by Chinese passes the boundary check.
+        // Message includes an action word ("活动") so classify can
+        // even commit to events kind.
+        let mut d = sample_dict();
+        d.categories = vec![tw(&["art"], TAG_CAT_ART)];
+        let r = classify("今天的 art 活动有什么", &d).unwrap();
+        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
     }
 }
