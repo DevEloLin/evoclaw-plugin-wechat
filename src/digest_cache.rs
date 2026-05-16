@@ -577,8 +577,7 @@ mod tests {
     #[test]
     fn snapshot_refuses_meta_data_version_mismatch() {
         let tmp = unique_tmp("vermismatch");
-        let (meta, data) =
-            jsons_with_versions(DIGEST_SCHEMA_VERSION, DIGEST_SCHEMA_VERSION + 1);
+        let (meta, data) = jsons_with_versions(DIGEST_SCHEMA_VERSION, DIGEST_SCHEMA_VERSION + 1);
         write_snapshot(&tmp, &meta, &data);
         let cache = DigestCache::new(make_cfg(tmp));
         assert!(cache.snapshot().is_none());

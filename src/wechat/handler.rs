@@ -176,8 +176,7 @@ pub async fn handle_message(
                     // payloads alongside encrypted ones; try plain verify.
                     if cfg.wechat.encrypt_mode == EncryptMode::Compatible {
                         if let Some(sig) = q.signature.as_deref() {
-                            let expected =
-                                signature::plain_signature(&cfg.wechat.token, ts, nonce);
+                            let expected = signature::plain_signature(&cfg.wechat.token, ts, nonce);
                             if signature::verify(&expected, sig) {
                                 tracing::debug!("compatible mode: falling back to plain");
                                 return dispatch_and_reply(&state, body, false).await;
@@ -612,7 +611,11 @@ mod tests {
         // in `dispatch_and_reply` exactly.
         let cache = fresh_reply_cache();
         let msg_id = "shared-msg-id";
-        store_reply(&cache, &format!("oUserAlice:{msg_id}"), "answer-for-alice".into());
+        store_reply(
+            &cache,
+            &format!("oUserAlice:{msg_id}"),
+            "answer-for-alice".into(),
+        );
         // Bob's key is different — must miss even though `msg_id` matches.
         assert!(
             lookup_cached_reply(&cache, &format!("oUserBob:{msg_id}")).is_none(),

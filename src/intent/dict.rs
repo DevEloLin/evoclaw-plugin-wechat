@@ -88,8 +88,7 @@ fn word_matches(haystack_lower: &str, word_lower: &str) -> bool {
         if &bytes[i..i + n] == needle {
             let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
             let after_idx = i + n;
-            let after_ok =
-                after_idx == bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
+            let after_ok = after_idx == bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
             if before_ok && after_ok {
                 return true;
             }

@@ -154,7 +154,13 @@ async fn spawn_plugin() -> Option<Harness> {
     // Skip on environments without python3 (CI runners usually have it,
     // but be defensive). The python check is just a precondition for the
     // fake evoclaw script — the plugin itself doesn't need python.
-    if Command::new("python3").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+    if Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
         return None;
     }
 
@@ -239,7 +245,9 @@ async fn post(
 #[tokio::test]
 #[serial]
 async fn round_trip_text_message_returns_passive_reply_xml() {
-    let Some(h) = spawn_plugin().await else { return };
+    let Some(h) = spawn_plugin().await else {
+        return;
+    };
     let client = reqwest::Client::new();
     let ts = now_unix_secs();
     let nonce = unique_nonce();
@@ -274,7 +282,9 @@ async fn round_trip_text_message_returns_passive_reply_xml() {
 #[tokio::test]
 #[serial]
 async fn bad_signature_returns_403() {
-    let Some(h) = spawn_plugin().await else { return };
+    let Some(h) = spawn_plugin().await else {
+        return;
+    };
     let client = reqwest::Client::new();
     let ts = now_unix_secs();
     let nonce = unique_nonce();
@@ -293,7 +303,9 @@ async fn bad_signature_returns_403() {
 #[tokio::test]
 #[serial]
 async fn replayed_nonce_returns_403_on_second_use() {
-    let Some(h) = spawn_plugin().await else { return };
+    let Some(h) = spawn_plugin().await else {
+        return;
+    };
     let client = reqwest::Client::new();
     let ts = now_unix_secs();
     let nonce = unique_nonce();
@@ -309,7 +321,9 @@ async fn replayed_nonce_returns_403_on_second_use() {
 #[tokio::test]
 #[serial]
 async fn ancient_timestamp_returns_403() {
-    let Some(h) = spawn_plugin().await else { return };
+    let Some(h) = spawn_plugin().await else {
+        return;
+    };
     let client = reqwest::Client::new();
     let ts = "1000000000"; // year 2001
     let nonce = unique_nonce();
@@ -329,7 +343,9 @@ async fn ancient_timestamp_returns_403() {
 #[tokio::test]
 #[serial]
 async fn msg_id_retry_returns_cached_first_answer() {
-    let Some(h) = spawn_plugin().await else { return };
+    let Some(h) = spawn_plugin().await else {
+        return;
+    };
     let client = reqwest::Client::new();
     let msg_id = "mid-retry-cache";
 
@@ -383,7 +399,9 @@ async fn msg_id_cache_is_isolated_per_sender_openid() {
     // each other's cached answer. WeChat documents MsgId as globally
     // unique, but the plugin's cache key still composes `{from}:{msg_id}`
     // defensively. Verifies that contract end-to-end.
-    let Some(h) = spawn_plugin().await else { return };
+    let Some(h) = spawn_plugin().await else {
+        return;
+    };
     let client = reqwest::Client::new();
     let shared_msg_id = "collision-mid";
 
@@ -433,7 +451,9 @@ async fn msg_id_cache_is_isolated_per_sender_openid() {
 #[tokio::test]
 #[serial]
 async fn subscribe_event_returns_welcome_text() {
-    let Some(h) = spawn_plugin().await else { return };
+    let Some(h) = spawn_plugin().await else {
+        return;
+    };
     let client = reqwest::Client::new();
     let ts = now_unix_secs();
     let nonce = unique_nonce();
@@ -459,7 +479,9 @@ async fn subscribe_event_returns_welcome_text() {
 #[tokio::test]
 #[serial]
 async fn url_verification_get_echoes_back() {
-    let Some(h) = spawn_plugin().await else { return };
+    let Some(h) = spawn_plugin().await else {
+        return;
+    };
     let client = reqwest::Client::new();
     let ts = now_unix_secs();
     let nonce = unique_nonce();
@@ -480,4 +502,3 @@ async fn url_verification_get_echoes_back() {
     let body = resp.text().await.unwrap();
     assert_eq!(body, echo);
 }
-

@@ -373,9 +373,9 @@ impl BridgePool {
         }
         let mut slots: Vec<Arc<Slot>> = Vec::with_capacity(count);
         for i in 0..count {
-            let b = Bridge::spawn(binary, extra_args).await.map_err(|e| {
-                PluginError::Backend(format!("spawn worker #{i}: {e}"))
-            })?;
+            let b = Bridge::spawn(binary, extra_args)
+                .await
+                .map_err(|e| PluginError::Backend(format!("spawn worker #{i}: {e}")))?;
             slots.push(Arc::new(RwLock::new(Arc::new(b))));
         }
         // Startup aliveness check. `cmd.spawn()` returns Ok as soon as the
@@ -423,9 +423,7 @@ impl BridgePool {
     /// skip further spawn attempts for now.
     fn in_respawn_cooldown(&self) -> bool {
         match self.last_respawn_failed_at.lock() {
-            Ok(g) => g
-                .as_ref()
-                .is_some_and(|t| t.elapsed() < RESPAWN_COOLDOWN),
+            Ok(g) => g.as_ref().is_some_and(|t| t.elapsed() < RESPAWN_COOLDOWN),
             // Lock poisoning shouldn't happen here (we only ever do a tiny
             // mutate-and-drop), but be conservative and assume "no cooldown"
             // so we don't get stuck permanently.
@@ -489,8 +487,7 @@ impl BridgePool {
             }
         }
         Err(PluginError::Backend(if self.in_respawn_cooldown() {
-            "all bridge slots dead; in respawn cooldown after recent failure"
-                .into()
+            "all bridge slots dead; in respawn cooldown after recent failure".into()
         } else {
             "all bridge slots dead and respawn failed".into()
         }))
@@ -645,7 +642,10 @@ mod tests {
         // marks cooldown → checkout returns Err.
         let r1 = pool.checkout().await;
         assert!(r1.is_err(), "first checkout should fail (binary missing)");
-        assert!(pool.in_respawn_cooldown(), "cooldown must engage after failure");
+        assert!(
+            pool.in_respawn_cooldown(),
+            "cooldown must engage after failure"
+        );
 
         // Second checkout: cooldown still active → should NOT attempt
         // another spawn (we'd see two spawn-failures in logs if it did).
@@ -695,14 +695,7 @@ mod tests {
         // `evoclaw.extra_args`, evoclaw exits within ms with a clap
         // error. The pool MUST surface this at startup. `false` exits
         // immediately regardless of argv.
-        let err = match BridgePool::spawn(
-            "false",
-            &[],
-            1,
-            Duration::from_millis(500),
-        )
-        .await
-        {
+        let err = match BridgePool::spawn("false", &[], 1, Duration::from_millis(500)).await {
             Ok(_) => panic!("BridgePool::spawn must fail when subprocess dies immediately"),
             Err(e) => e,
         };
@@ -749,7 +742,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         std::fs::remove_file(&script).ok();
-        assert!(got_stderr, "subprocess never marked dead with non-empty stderr");
+        assert!(
+            got_stderr,
+            "subprocess never marked dead with non-empty stderr"
+        );
         let snap = bridge.recent_stderr();
         assert!(
             snap.iter().any(|l| l.contains("BOOM")),
