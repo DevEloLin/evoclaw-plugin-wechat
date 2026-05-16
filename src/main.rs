@@ -12,6 +12,9 @@ mod intent;
 mod util;
 mod wechat;
 
+#[cfg(test)]
+mod test_fixtures;
+
 use crate::bridge::BridgePool;
 use crate::config::{Config, EncryptMode};
 use crate::wechat::handler::{handle_message, verify_url, HandlerState};

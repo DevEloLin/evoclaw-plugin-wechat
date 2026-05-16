@@ -112,22 +112,7 @@ fn pick_tag(haystack_lower: &str, tags: &[TagWords]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::digest_cache::DateTag;
-
-    // Tag values used both in the dict and in assertions. Keeping
-    // them as constants makes "what is the canonical tag?" a single
-    // source of truth across the test module.
-    const TAG_TODAY: &str = "today";
-    const TAG_WEEKEND: &str = "weekend";
-    const TAG_COUNTRY_UAE: &str = "UAE";
-    const TAG_COUNTRY_TURKEY: &str = "Turkey";
-    const TAG_COUNTRY_NEPAL: &str = "Nepal";
-    const TAG_CITY_DUBAI: &str = "Dubai";
-    const TAG_CITY_ABU_DHABI: &str = "AbuDhabi";
-    const TAG_CITY_ISTANBUL: &str = "Istanbul";
-    const TAG_CITY_KATHMANDU: &str = "Kathmandu";
-    const TAG_CAT_ART: &str = "art";
-    const TAG_CAT_MUSIC: &str = "music";
-    const TAG_TIME_EVENING: &str = "evening";
+    use crate::test_fixtures::*;
 
     fn tw(words: &[&str], tag: &str) -> TagWords {
         TagWords {
@@ -145,21 +130,21 @@ mod tests {
                 tw(&["周末", "weekend"], TAG_WEEKEND),
             ],
             countries: vec![
-                tw(&["阿联酋", "UAE", "uae"], TAG_COUNTRY_UAE),
-                tw(&["土耳其", "Turkey", "turkey"], TAG_COUNTRY_TURKEY),
-                tw(&["尼泊尔", "Nepal", "nepal"], TAG_COUNTRY_NEPAL),
+                tw(&["阿联酋", "UAE", "uae"], COUNTRY_UAE),
+                tw(&["土耳其", "Turkey", "turkey"], COUNTRY_TURKEY),
+                tw(&["尼泊尔", "Nepal", "nepal"], COUNTRY_NEPAL),
             ],
             cities: vec![
-                tw(&["迪拜", "dubai"], TAG_CITY_DUBAI),
-                tw(&["阿布扎比", "abudhabi"], TAG_CITY_ABU_DHABI),
-                tw(&["伊斯坦布尔", "istanbul"], TAG_CITY_ISTANBUL),
-                tw(&["加德满都", "kathmandu"], TAG_CITY_KATHMANDU),
+                tw(&["迪拜", "dubai"], CITY_DUBAI),
+                tw(&["阿布扎比", "abudhabi"], CITY_ABU_DHABI),
+                tw(&["伊斯坦布尔", "istanbul"], CITY_ISTANBUL),
+                tw(&["加德满都", "kathmandu"], CITY_KATHMANDU),
             ],
             categories: vec![
-                tw(&["艺术", "art"], TAG_CAT_ART),
-                tw(&["音乐", "music"], TAG_CAT_MUSIC),
+                tw(&["艺术", "art"], CATEGORY_ART),
+                tw(&["音乐", "music"], CATEGORY_MUSIC),
             ],
-            times: vec![tw(&["晚上", "evening"], TAG_TIME_EVENING)],
+            times: vec![tw(&["晚上", "evening"], TIME_EVENING)],
         }
     }
 
@@ -194,16 +179,16 @@ mod tests {
         let r = classify("今天迪拜的艺术活动", &sample_dict()).unwrap();
         assert_eq!(r.kind, crate::intent::IntentKind::Events);
         assert_eq!(r.filter.date, Some(DateTag::Today));
-        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_DUBAI));
-        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
+        assert_eq!(r.filter.city.as_deref(), Some(CITY_DUBAI));
+        assert_eq!(r.filter.category.as_deref(), Some(CATEGORY_ART));
     }
 
     #[test]
     fn weekend_music_in_abudhabi() {
         let r = classify("周末阿布扎比有什么音乐活动", &sample_dict()).unwrap();
         assert_eq!(r.filter.date, Some(DateTag::Weekend));
-        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_ABU_DHABI));
-        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_MUSIC));
+        assert_eq!(r.filter.city.as_deref(), Some(CITY_ABU_DHABI));
+        assert_eq!(r.filter.category.as_deref(), Some(CATEGORY_MUSIC));
     }
 
     #[test]
@@ -211,15 +196,15 @@ mod tests {
         let r = classify("Tonight Dubai 有 ART event 推荐吗", &sample_dict()).unwrap();
         // 'tonight' isn't in our dates dictionary, but 'art' / 'dubai' / 'event' are.
         assert_eq!(r.kind, crate::intent::IntentKind::Events);
-        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_DUBAI));
-        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
+        assert_eq!(r.filter.city.as_deref(), Some(CITY_DUBAI));
+        assert_eq!(r.filter.category.as_deref(), Some(CATEGORY_ART));
     }
 
     #[test]
     fn extracts_country_only_when_no_city_mentioned() {
         let r = classify("土耳其有什么活动", &sample_dict()).unwrap();
         assert_eq!(r.kind, crate::intent::IntentKind::Events);
-        assert_eq!(r.filter.country.as_deref(), Some(TAG_COUNTRY_TURKEY));
+        assert_eq!(r.filter.country.as_deref(), Some(COUNTRY_TURKEY));
         assert!(r.filter.city.is_none());
     }
 
@@ -231,9 +216,9 @@ mod tests {
         // with no city will NOT match (intentional: user asked for
         // a specific city).
         let r = classify("土耳其伊斯坦布尔的艺术活动", &sample_dict()).unwrap();
-        assert_eq!(r.filter.country.as_deref(), Some(TAG_COUNTRY_TURKEY));
-        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_ISTANBUL));
-        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
+        assert_eq!(r.filter.country.as_deref(), Some(COUNTRY_TURKEY));
+        assert_eq!(r.filter.city.as_deref(), Some(CITY_ISTANBUL));
+        assert_eq!(r.filter.category.as_deref(), Some(CATEGORY_ART));
     }
 
     #[test]
@@ -241,8 +226,8 @@ mod tests {
         // Different country to prove the matcher is genuinely
         // config-driven, not biased toward UAE / Turkey.
         let r = classify("尼泊尔加德满都有什么好玩的", &sample_dict()).unwrap();
-        assert_eq!(r.filter.country.as_deref(), Some(TAG_COUNTRY_NEPAL));
-        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_KATHMANDU));
+        assert_eq!(r.filter.country.as_deref(), Some(COUNTRY_NEPAL));
+        assert_eq!(r.filter.city.as_deref(), Some(CITY_KATHMANDU));
     }
 
     #[test]
@@ -270,7 +255,7 @@ mod tests {
         let mut d = sample_dict();
         // Use dict that only has "art" as category, no Chinese form,
         // so the message must boundary-match "art" to get a category.
-        d.categories = vec![tw(&["art"], TAG_CAT_ART)];
+        d.categories = vec![tw(&["art"], CATEGORY_ART)];
         let r = classify("smart event recommendation", &d).unwrap();
         assert_eq!(r.kind, crate::intent::IntentKind::Events);
         // "smart" must NOT match the dictionary word "art" — category
@@ -285,7 +270,7 @@ mod tests {
     #[test]
     fn ascii_word_matches_at_real_word_boundary() {
         let mut d = sample_dict();
-        d.categories = vec![tw(&["art"], TAG_CAT_ART)];
+        d.categories = vec![tw(&["art"], CATEGORY_ART)];
         // Real word boundaries: space, punctuation, end-of-string.
         for msg in [
             "I love art event",       // space before, space after
@@ -297,7 +282,7 @@ mod tests {
             let r = classify(msg, &d).unwrap_or_else(|| panic!("dict missed: {msg}"));
             assert_eq!(
                 r.filter.category.as_deref(),
-                Some(TAG_CAT_ART),
+                Some(CATEGORY_ART),
                 "should match 'art' as standalone word in: {msg}"
             );
         }
@@ -309,7 +294,7 @@ mod tests {
         // boundaries, so substring matching is the only sensible rule.
         // Word-boundary check must NOT apply to non-ASCII words.
         let r = classify("今天艺术展览有意思的活动", &sample_dict()).unwrap();
-        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
+        assert_eq!(r.filter.category.as_deref(), Some(CATEGORY_ART));
     }
 
     #[test]
@@ -320,8 +305,8 @@ mod tests {
         // Message includes an action word ("活动") so classify can
         // even commit to events kind.
         let mut d = sample_dict();
-        d.categories = vec![tw(&["art"], TAG_CAT_ART)];
+        d.categories = vec![tw(&["art"], CATEGORY_ART)];
         let r = classify("今天的 art 活动有什么", &d).unwrap();
-        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
+        assert_eq!(r.filter.category.as_deref(), Some(CATEGORY_ART));
     }
 }

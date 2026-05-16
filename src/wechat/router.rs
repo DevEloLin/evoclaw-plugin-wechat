@@ -166,17 +166,7 @@ mod tests {
     // Canonical city/category tags. MUST match the values our tests
     // sprinkle into Event::city / Event::category — that's the whole
     // point of canonical-tag matching. Changes here propagate.
-    const COUNTRY_UAE: &str = "UAE";
-    const COUNTRY_TURKEY: &str = "Turkey";
-    const COUNTRY_NEPAL: &str = "Nepal";
-    const CITY_DUBAI: &str = "Dubai";
-    const CITY_ABU_DHABI: &str = "AbuDhabi";
-    const CITY_SHARJAH: &str = "Sharjah";
-    const CITY_ISTANBUL: &str = "Istanbul";
-    const CITY_KATHMANDU: &str = "Kathmandu";
-    const CITY_NO_MATCH: &str = "Mars"; // intentionally absent from fixtures
-    const CATEGORY_ART: &str = "art";
-    const CATEGORY_MUSIC: &str = "music";
+    use crate::test_fixtures::*;
 
     /// Build a one-off digest snapshot. `days` is what
     /// `DigestSnapshot::days_covered` will report (drives the
