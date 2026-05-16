@@ -125,9 +125,16 @@ pub fn build_conversation_id(app_id: &str, from_user: &str) -> String {
     sanitize(app_id, &mut cid);
     cid.push('-');
     sanitize(from_user, &mut cid);
-    // Enforce a length cap matching EvoClaw's SessionStore MAX_CID_LEN
-    // so the file path stays within filesystem limits.
-    const MAX: usize = 128;
+    // Enforce a length cap matching EvoClaw's SessionStore MAX_CID_LEN.
+    // After `sanitize()` every char is ASCII, so byte len == char len —
+    // String::truncate(MAX) lands on a char boundary safely.
+    //
+    // Why 256 (not 128): the typical cid is `wx-{app_id}-{openid}` ≈
+    // 3 + ≤32 + 1 + 28 = ~64 chars. Bumping the ceiling to 256 means
+    // even pathological app_id lengths (e.g. a long custom domain) get
+    // a stable cid before truncation can ever collide two distinct
+    // openids onto the same prefix.
+    const MAX: usize = 256;
     if cid.len() > MAX {
         cid.truncate(MAX);
     }
