@@ -701,12 +701,9 @@ find /var/lib/evoclaw/sessions -mindepth 2 -name '*.jsonl' -mtime +30 -delete
 find /var/lib/evoclaw/sessions -mindepth 2 -name '.*.tmp.*' -mtime +1 -delete  # 残留临时文件
 ```
 
-**`ic-*` 文件(intent 分类临时文件)**:每次 AI 意图分类会产生一个一次性 cid,
-持续累积会占磁盘。建议每周清理一次:
-
-```bash
-find /var/lib/evoclaw/sessions -name 'ic-*.jsonl' -mtime +7 -delete
-```
+**intent 分类不产生持久文件**:AI 意图分类用 `_ephemeral_ic-{nanos}` 前缀的
+cid 调 evoclaw,EvoClaw 的 SessionStore 检测到 `_ephemeral_` 前缀会跳过 load/save,
+**完全不写盘**。所以无需为意图分类做任何清理。
 
 ### `max_turns` 调优
 

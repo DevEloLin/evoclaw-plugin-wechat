@@ -233,7 +233,19 @@ async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
     // can't make us busy-sweep.
     if cfg.session.dir.is_some() {
         let gc_serializer = state.conv_serializer.clone();
-        let gc_interval = std::time::Duration::from_secs(cfg.session.gc_interval_secs.max(60));
+        // Clamp gc_interval to ≥60s to prevent a busy-spin from a tiny
+        // misconfig. Warn loudly if we had to clamp so the operator
+        // discovers it in the logs instead of being silently overruled.
+        const MIN_GC_INTERVAL_SECS: u64 = 60;
+        if cfg.session.gc_interval_secs < MIN_GC_INTERVAL_SECS {
+            tracing::warn!(
+                configured = cfg.session.gc_interval_secs,
+                clamped = MIN_GC_INTERVAL_SECS,
+                "session.gc_interval_secs clamped to minimum to prevent busy-spin"
+            );
+        }
+        let gc_interval =
+            std::time::Duration::from_secs(cfg.session.gc_interval_secs.max(MIN_GC_INTERVAL_SECS));
         let gc_idle = std::time::Duration::from_secs(cfg.session.cid_lock_idle_secs);
         tokio::spawn(async move {
             // Use a tokio interval so we self-correct after long pauses

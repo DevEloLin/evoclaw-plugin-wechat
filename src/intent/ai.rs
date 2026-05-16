@@ -118,12 +118,15 @@ impl AiClassifier {
                 return Intent::unknown();
             }
         };
-        // Use a unique cid per classification so the (optional) session
-        // store doesn't accumulate stale "intent classifier history" —
-        // each classification call is conceptually independent. The
-        // EvoClaw side will create+leave a tiny per-call jsonl; the
-        // documented operations playbook trims `ic-*` files periodically.
-        let cid = format!("ic-{}", crate::util::current_unix_nanos());
+        // Use a unique, ephemeral cid per classification. The
+        // `_ephemeral_` prefix tells EvoClaw's SessionStore to skip the
+        // load/save entirely — so intent-classifier calls leave NO
+        // persistent footprint on disk, regardless of how many fire.
+        // (Earlier versions of this code used `ic-{nanos}` which DID
+        // write a one-shot session file per call; that was correct but
+        // accumulated millions of files on busy deployments and forced
+        // operators to run periodic find-delete cron jobs.)
+        let cid = format!("_ephemeral_ic-{}", crate::util::current_unix_nanos());
         let result =
             tokio::time::timeout(self.timeout, bridge.ask(&cid, "intent-classifier", &prompt))
                 .await;
