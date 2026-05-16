@@ -432,22 +432,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    // ----- Test fixtures (single source of truth for sample data).
+    use crate::test_fixtures::*;
+
+    // ----- Module-local test fixtures (filesystem layout details not
+    // shared with the dict / router test suites).
     const LATEST_SUBDIR: &str = "latest";
     const META_FILE: &str = "meta.json";
     const DATA_FILE: &str = "data.json";
     const TMP_PREFIX: &str = "evo-digest-cache-";
     const TEST_GENERATED_AT: &str = "2026-05-16T00:00:00Z";
-
-    const COUNTRY_UAE: &str = "UAE";
-    const COUNTRY_TURKEY: &str = "Turkey";
-    const COUNTRY_NEPAL: &str = "Nepal";
-    const CITY_DUBAI: &str = "Dubai";
-    const CITY_ABU_DHABI: &str = "AbuDhabi";
-    const CITY_ISTANBUL: &str = "Istanbul";
-    const CITY_KATHMANDU: &str = "Kathmandu";
-    const CATEGORY_ART: &str = "art";
-    const CATEGORY_MUSIC: &str = "music";
 
     fn make_cfg(data_dir: PathBuf) -> DigestCfg {
         DigestCfg {
