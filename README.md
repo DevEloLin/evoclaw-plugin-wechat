@@ -195,10 +195,12 @@ passive-reply bridges in practice:
 
 - **Passive reply only** — no async push to users (would require 微信认证
   + 客服消息接口)
-- **Stateless per message** — each user message is independent; no
-  multi-turn history across messages within the same conversation. (This
-  is a property of `evoclaw channel run`'s current implementation; can be
-  lifted later upstream.)
+- **Multi-turn history per fan** (opt-in): set `[session].dir` in
+  `wechat.toml` to persist each WeChat OpenID's conversation history
+  as jsonl under that directory. Same fan's later messages see prior
+  turns; different fans stay fully isolated. See `docs/USAGE.md` →
+  "多轮会话与用户隔离" for capacity / disk / TTL guidance. Leaving
+  `dir` unset keeps the legacy stateless-per-message behaviour.
 - **Text messages only** — image / voice / video inbound currently ack
   silently. Extend `wechat::handler` if you need to handle these.
 

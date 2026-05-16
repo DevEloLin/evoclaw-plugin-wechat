@@ -147,7 +147,12 @@ impl AiClassifier {
         match parse_intent(&raw) {
             Ok(i) => i,
             Err(e) => {
-                tracing::warn!(error = %e, raw = %raw,
+                // Do NOT log `raw` — the classifier's reply often echoes
+                // (or paraphrases) the user message, which would push fan
+                // chat content into ops logs in violation of PRD §13.4.
+                // The error itself is enough to triage; rerun the failing
+                // input in a dev environment if a full trace is needed.
+                tracing::warn!(error = %e, len = raw.len(),
                     "intent: failed to parse classifier output");
                 Intent::unknown()
             }
