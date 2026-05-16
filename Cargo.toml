@@ -2,10 +2,10 @@
 name = "evoclaw-plugin-wechat"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.80"
 description = "WeChat Official Account passive-reply bridge for the EvoClaw agent runtime"
 license = "MIT"
-repository = "https://github.com/your-org/evoclaw-plugin-wechat"
+repository = "https://github.com/DevEloLin/evoclaw-plugin-wechat"
 readme = "README.md"
 keywords = ["wechat", "weixin", "evoclaw", "agent", "llm"]
 categories = ["command-line-utilities"]

@@ -1,7 +1,7 @@
 # evoclaw-plugin-wechat
 
 WeChat Official Account passive-reply bridge for the
-[EvoClaw](https://github.com/your-org/EvoClaw) agent runtime.
+[EvoClaw](https://github.com/DevEloLin/evoclaw) agent runtime.
 
 When a fan DMs your public account, this plugin:
 
@@ -27,7 +27,7 @@ No 微信认证 required, no 客服消息接口 used. Pure被动回复.
 ## Why a separate binary
 
 EvoClaw already ships a `ChannelAdapter` extension point (see
-[`evo_core::channel`](https://github.com/your-org/EvoClaw/blob/main/crates/evo-core/src/channel.rs))
+[`evo_core::channel`](https://github.com/DevEloLin/evoclaw/blob/main/crates/evo-core/src/channel.rs))
 and a stdio-JSON local-pipe channel. This plugin lives **outside the
 EvoClaw repo** and talks to it via that protocol, so:
 
@@ -51,7 +51,7 @@ EvoClaw repo** and talks to it via that protocol, so:
 ### Install
 
 ```bash
-git clone https://github.com/your-org/evoclaw-plugin-wechat
+git clone https://github.com/DevEloLin/evoclaw-plugin-wechat
 cd evoclaw-plugin-wechat
 cargo install --path .
 ```

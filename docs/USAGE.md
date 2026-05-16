@@ -73,7 +73,7 @@ HTTP 200 OK → 微信服务器 → 用户
 ### 方式一:从源码编译(推荐)
 
 ```bash
-git clone https://github.com/<your-org>/evoclaw-plugin-wechat
+git clone https://github.com/DevEloLin/evoclaw-plugin-wechat
 cd evoclaw-plugin-wechat
 cargo install --path .
 ```
