@@ -6,7 +6,9 @@
 
 mod bridge;
 mod config;
+mod digest_cache;
 mod error;
+mod intent;
 mod util;
 mod wechat;
 
@@ -164,11 +166,31 @@ async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
         &cfg.evoclaw.binary,
         &cfg.evoclaw.extra_args,
         cfg.evoclaw.worker_count,
+        std::time::Duration::from_millis(cfg.evoclaw.startup_grace_ms),
     )
     .await
     .map_err(|e| eyre::eyre!("{e}"))?;
+    let pool = Arc::new(pool);
 
-    let state = HandlerState::new(cfg.clone(), Arc::new(pool), aes_key);
+    // Digest cache is always constructed (its `snapshot()` returns None
+    // when `digest.enabled = false`, so it's free to ask). This keeps
+    // HandlerState type stable across config modes.
+    let digest_cache = Arc::new(crate::digest_cache::DigestCache::new(cfg.digest.clone()));
+
+    // AI classifier is only built when both intent + ai_fallback are
+    // enabled. Avoids spending a `BridgePool::checkout` slot per
+    // request when the user opted out.
+    let ai_classifier = if cfg.intent.enabled && cfg.intent.ai_fallback {
+        Some(Arc::new(crate::intent::ai::AiClassifier::new(
+            pool.clone(),
+            std::time::Duration::from_millis(cfg.intent.ai_timeout_ms),
+            cfg.intent.ai_prompt_override.clone(),
+        )))
+    } else {
+        None
+    };
+
+    let state = HandlerState::new(cfg.clone(), pool, aes_key, digest_cache, ai_classifier);
 
     let app = Router::new()
         .route(

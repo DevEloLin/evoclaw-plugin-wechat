@@ -115,6 +115,62 @@ pub fn build_text_reply(to_user: &str, from_user: &str, content: &str) -> String
     )
 }
 
+/// A single article inside an outbound `MsgType=news` (图文消息) reply.
+///
+/// **Image hosting**: `pic_url` and `url` must point at HTTPS endpoints
+/// on an ICP-filed domain — WeChat fetches `pic_url` server-side, and
+/// users tap the card to navigate to `url`. Without ICP-filed
+/// hosting, both will be refused at WeChat's edge.
+///
+/// **No `MediaId` is needed for news**. Unlike the `MsgType=image`
+/// reply (which requires a previously-uploaded `MediaId` from a 微信
+/// 认证 account), passive-reply news messages take a plain HTTPS URL
+/// — which is what makes this the recommended path for unauthenticated
+/// public accounts that want image+text replies.
+#[derive(Debug, Clone)]
+pub struct NewsArticle {
+    pub title: String,
+    pub description: String,
+    pub pic_url: String,
+    pub url: String,
+}
+
+/// Build an outbound `MsgType=news` (图文消息) passive-reply envelope.
+///
+/// WeChat caps `articles` at 8 entries (legacy) — in practice 1 is the
+/// most reliable shape across clients. Caller decides; we don't enforce.
+pub fn build_news_reply(to_user: &str, from_user: &str, articles: &[NewsArticle]) -> String {
+    let now = crate::util::current_unix_secs();
+    let mut items = String::new();
+    for a in articles {
+        items.push_str(&format!(
+            "<item>\
+<Title><![CDATA[{}]]></Title>\
+<Description><![CDATA[{}]]></Description>\
+<PicUrl><![CDATA[{}]]></PicUrl>\
+<Url><![CDATA[{}]]></Url>\
+</item>",
+            escape_cdata(&a.title),
+            escape_cdata(&a.description),
+            escape_cdata(&a.pic_url),
+            escape_cdata(&a.url),
+        ));
+    }
+    format!(
+        "<xml>\
+<ToUserName><![CDATA[{to}]]></ToUserName>\
+<FromUserName><![CDATA[{from}]]></FromUserName>\
+<CreateTime>{now}</CreateTime>\
+<MsgType><![CDATA[news]]></MsgType>\
+<ArticleCount>{count}</ArticleCount>\
+<Articles>{items}</Articles>\
+</xml>",
+        to = escape_cdata(to_user),
+        from = escape_cdata(from_user),
+        count = articles.len(),
+    )
+}
+
 /// Defensively neutralize `]]>` inside the body — WeChat clients don't
 /// always tolerate it; splitting the marker lets the rest of the text
 /// through unharmed.
@@ -134,6 +190,13 @@ fn decode_text(t: BytesText<'_>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- Test fixtures (centralised so URL / openid changes don't
+    // require sweeping every assertion).
+    const GH_OPENID: &str = "gh_abc"; // public-account "MP" id
+    const USER_OPENID: &str = "oUser123";
+    const TEST_PIC_URL: &str = "https://example.com/cover.jpg";
+    const TEST_LANDING_URL: &str = "https://example.com/page";
 
     const SAMPLE_TEXT: &str = r#"
 <xml>
@@ -160,7 +223,7 @@ mod tests {
     fn parses_text_message() {
         let m = parse_inbound(SAMPLE_TEXT).unwrap();
         assert_eq!(m.msg_type, "text");
-        assert_eq!(m.from_user_name, "oUser123");
+        assert_eq!(m.from_user_name, USER_OPENID);
         assert_eq!(m.content.as_deref(), Some("你好,小助手"));
         assert_eq!(m.msg_id.as_deref(), Some("123456789"));
     }
@@ -182,22 +245,98 @@ mod tests {
 
     #[test]
     fn build_text_reply_round_trips() {
-        let xml = build_text_reply("oUser", "gh_abc", "hello");
+        const BODY: &str = "hello";
+        let xml = build_text_reply(USER_OPENID, GH_OPENID, BODY);
         let m = parse_inbound(&xml).unwrap();
         assert_eq!(m.msg_type, "text");
-        assert_eq!(m.from_user_name, "gh_abc");
-        assert_eq!(m.to_user_name, "oUser");
-        assert_eq!(m.content.as_deref(), Some("hello"));
+        // Note: passive-reply flips the names — `from_user` arg of
+        // build_text_reply becomes the `<FromUserName>` of the reply
+        // envelope (i.e. the public account answering).
+        assert_eq!(m.from_user_name, GH_OPENID);
+        assert_eq!(m.to_user_name, USER_OPENID);
+        assert_eq!(m.content.as_deref(), Some(BODY));
     }
 
     #[test]
     fn build_text_reply_neutralizes_cdata_end_marker() {
-        let xml = build_text_reply("a", "b", "evil ]]> payload");
+        const DANGEROUS_INPUT: &str = "evil ]]> payload";
+        const SAFE_OUTPUT_MARKER: &str = "]]]]><![CDATA[>";
+        let xml = build_text_reply(USER_OPENID, GH_OPENID, DANGEROUS_INPUT);
         // The raw `]]>` must not appear unescaped in the CDATA block, otherwise
         // we'd terminate the section early and emit invalid XML.
-        assert!(!xml.contains("evil ]]> payload"));
+        assert!(!xml.contains(DANGEROUS_INPUT));
         // The escaped form should be present.
-        assert!(xml.contains("]]]]><![CDATA[>"));
+        assert!(xml.contains(SAFE_OUTPUT_MARKER));
+    }
+
+    /// Build a NewsArticle from a small index — used by tests that need
+    /// multiple distinct-but-similar articles. The format-strings ARE the
+    /// template (each `{i}` is the index); no per-test variation.
+    fn make_test_article(i: usize) -> NewsArticle {
+        NewsArticle {
+            title: format!("T{i}"),
+            description: format!("D{i}"),
+            pic_url: format!("{TEST_PIC_URL}?n={i}"),
+            url: format!("{TEST_LANDING_URL}?n={i}"),
+        }
+    }
+
+    #[test]
+    fn build_news_reply_single_article_structure() {
+        const TITLE: &str = "T";
+        const DESC: &str = "D";
+        let xml = build_news_reply(
+            USER_OPENID,
+            GH_OPENID,
+            &[NewsArticle {
+                title: TITLE.into(),
+                description: DESC.into(),
+                pic_url: TEST_PIC_URL.into(),
+                url: TEST_LANDING_URL.into(),
+            }],
+        );
+        // Assert envelope-level structure (these XML field names are
+        // protocol contract — must be exact).
+        assert!(xml.contains("<MsgType><![CDATA[news]]></MsgType>"));
+        assert!(xml.contains("<ArticleCount>1</ArticleCount>"));
+        // Assert payload content using fixtures (proves the values
+        // round-trip; what those values ARE is not the point).
+        assert!(xml.contains(&format!("<ToUserName><![CDATA[{USER_OPENID}]]>")));
+        assert!(xml.contains(&format!("<FromUserName><![CDATA[{GH_OPENID}]]>")));
+        assert!(xml.contains(&format!("<Title><![CDATA[{TITLE}]]>")));
+        assert!(xml.contains(&format!("<PicUrl><![CDATA[{TEST_PIC_URL}]]>")));
+        assert!(xml.contains(&format!("<Url><![CDATA[{TEST_LANDING_URL}]]>")));
+        let m = parse_inbound(&xml).unwrap();
+        assert_eq!(m.msg_type, "news");
+        assert_eq!(m.to_user_name, USER_OPENID);
+        assert_eq!(m.from_user_name, GH_OPENID);
+    }
+
+    #[test]
+    fn build_news_reply_multiple_articles_count_matches() {
+        const COUNT: usize = 3;
+        let arts: Vec<NewsArticle> = (0..COUNT).map(make_test_article).collect();
+        let xml = build_news_reply(USER_OPENID, GH_OPENID, &arts);
+        assert!(xml.contains(&format!("<ArticleCount>{COUNT}</ArticleCount>")));
+        assert_eq!(xml.matches("<item>").count(), COUNT);
+    }
+
+    #[test]
+    fn build_news_reply_neutralizes_cdata_in_description() {
+        const DANGEROUS_DESC: &str = "bad ]]> stuff";
+        const SAFE_OUTPUT_MARKER: &str = "]]]]><![CDATA[>";
+        let xml = build_news_reply(
+            USER_OPENID,
+            GH_OPENID,
+            &[NewsArticle {
+                title: "T".into(),
+                description: DANGEROUS_DESC.into(),
+                pic_url: TEST_PIC_URL.into(),
+                url: TEST_LANDING_URL.into(),
+            }],
+        );
+        assert!(!xml.contains(DANGEROUS_DESC));
+        assert!(xml.contains(SAFE_OUTPUT_MARKER));
     }
 
     #[test]

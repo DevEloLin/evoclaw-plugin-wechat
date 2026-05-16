@@ -62,6 +62,12 @@ pub struct HandlerState {
     pub pool: Arc<BridgePool>,
     /// AES-256 key, pre-decoded once at startup. `None` for plain mode.
     pub aes_key: Option<Arc<[u8; 32]>>,
+    /// Filesystem-backed digest cache. Always present; reads return
+    /// `None` when `cfg.digest.enabled = false` or when the cache file
+    /// is missing/stale (the absence is the signal, not the option).
+    pub digest_cache: Arc<crate::digest_cache::DigestCache>,
+    /// AI fallback classifier. `None` when `cfg.intent.ai_fallback = false`.
+    pub ai_classifier: Option<Arc<crate::intent::ai::AiClassifier>>,
     /// Per-`msg_id` reply cache so WeChat retries don't trigger a fresh
     /// LLM call. Created in `new_state()` (not by the caller).
     reply_cache: ReplyCache,
@@ -70,11 +76,19 @@ pub struct HandlerState {
 }
 
 impl HandlerState {
-    pub fn new(cfg: Arc<Config>, pool: Arc<BridgePool>, aes_key: Option<Arc<[u8; 32]>>) -> Self {
+    pub fn new(
+        cfg: Arc<Config>,
+        pool: Arc<BridgePool>,
+        aes_key: Option<Arc<[u8; 32]>>,
+        digest_cache: Arc<crate::digest_cache::DigestCache>,
+        ai_classifier: Option<Arc<crate::intent::ai::AiClassifier>>,
+    ) -> Self {
         Self {
             cfg,
             pool,
             aes_key,
+            digest_cache,
+            ai_classifier,
             reply_cache: Arc::new(StdMutex::new(HashMap::new())),
             nonce_cache: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -202,9 +216,19 @@ pub async fn handle_message(
     dispatch_and_reply(&state, decoded_xml, is_encrypted).await
 }
 
-/// Parse the decoded XML, route by message type, render an outbound XML
-/// reply, optionally re-encrypt it. This is also where the `msg_id` reply
-/// cache is consulted so WeChat retries don't re-trigger the LLM.
+/// Internal reply representation. Sits between "we decided what to say"
+/// and "we serialized it to XML". Keeps the decision logic agnostic of
+/// the wire format.
+enum ReplyPayload {
+    Text(String),
+    News(crate::wechat::xml::NewsArticle),
+}
+
+/// Parse the decoded XML, decide the reply payload, serialize to XML,
+/// optionally re-encrypt. The `msg_id` reply cache only stores text
+/// payloads; news replies are cheap to rebuild from the digest cache
+/// on every retry, so caching them buys nothing and complicates the
+/// cache shape.
 async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: bool) -> Response {
     let inbound = match wxml::parse_inbound(&xml) {
         Ok(m) => m,
@@ -218,65 +242,39 @@ async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: boo
     let to = inbound.to_user_name.clone();
     let cfg = &*state.cfg;
 
-    let reply_text: Option<String> = match inbound.msg_type.as_str() {
+    let payload: Option<ReplyPayload> = match inbound.msg_type.as_str() {
         "text" => {
             let user_msg = inbound.content.clone().unwrap_or_default();
             if user_msg.trim().is_empty() {
                 None
             } else {
-                // msg_id dedup: WeChat retries within 5s/15s using the same
-                // MsgId. Without this cache, a slow LLM that misses the
-                // first deadline would be triggered AGAIN by the retry
-                // (and again by the next retry) — wasting tokens and
-                // potentially returning out-of-order results.
-                //
-                // Cache key is `{FromUserName}:{MsgId}` — never bare MsgId.
-                // WeChat documents MsgId as globally unique, but binding the
-                // entry to the sender openid is a defensive guarantee that
-                // a (vanishingly unlikely) cross-user MsgId collision cannot
-                // leak one user's answer to another. openids never contain
-                // `:` and msg_ids are decimal digits, so the separator is
-                // unambiguous.
-                let msg_id = inbound.msg_id.as_deref().unwrap_or("");
-                if !msg_id.is_empty() {
-                    let cache_key = format!("{from}:{msg_id}");
-                    if let Some(cached) = lookup_cached_reply(&state.reply_cache, &cache_key) {
-                        tracing::info!(msg_id, sender = %from, "returning cached reply (WeChat retry)");
-                        Some(cached)
-                    } else {
-                        let answer = ask_with_timeout(state, &from, &user_msg).await;
-                        let capped = cap_reply_text(&answer, cfg.reply.max_chars);
-                        store_reply(&state.reply_cache, &cache_key, capped.clone());
-                        Some(capped)
-                    }
-                } else {
-                    // No MsgId (shouldn't happen for text, but defensive).
-                    let answer = ask_with_timeout(state, &from, &user_msg).await;
-                    Some(cap_reply_text(&answer, cfg.reply.max_chars))
-                }
+                Some(compute_text_payload(state, &from, &user_msg, inbound.msg_id.as_deref()).await)
             }
         }
         "event" => match inbound.event.as_deref().unwrap_or("") {
-            "subscribe" if !cfg.reply.welcome.is_empty() => {
-                Some(cap_reply_text(&cfg.reply.welcome, cfg.reply.max_chars))
-            }
-            _ if cfg.reply.echo_unknown_event => {
-                Some(cap_reply_text(&cfg.reply.fallback, cfg.reply.max_chars))
-            }
+            "subscribe" if !cfg.reply.welcome.is_empty() => Some(ReplyPayload::Text(
+                cap_reply_text(&cfg.reply.welcome, cfg.reply.max_chars),
+            )),
+            _ if cfg.reply.echo_unknown_event => Some(ReplyPayload::Text(cap_reply_text(
+                &cfg.reply.fallback,
+                cfg.reply.max_chars,
+            ))),
             _ => None,
         },
         _ => {
-            // Non-text non-event (image/voice/video/...) — ack silently
-            // for now. Extend this branch to support media auto-reply.
+            // Non-text non-event (image/voice/video/...) — ack silently.
             None
         }
     };
 
-    let Some(reply) = reply_text else {
+    let Some(payload) = payload else {
         return (StatusCode::OK, "").into_response();
     };
 
-    let plain_xml = wxml::build_text_reply(&from, &to, &reply);
+    let plain_xml = match payload {
+        ReplyPayload::Text(s) => wxml::build_text_reply(&from, &to, &s),
+        ReplyPayload::News(n) => wxml::build_news_reply(&from, &to, std::slice::from_ref(&n)),
+    };
     let body = if is_encrypted {
         match wrap_encrypted_envelope(state, &plain_xml) {
             Ok(s) => s,
@@ -295,6 +293,84 @@ async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: boo
         body,
     )
         .into_response()
+}
+
+/// Resolve a text-typed inbound message to a `ReplyPayload`.
+///
+/// Decision tree:
+///
+/// 1. **msg_id cache hit** → return the cached text payload as-is.
+///    Only text payloads are cached; news payloads recompute on retry
+///    (the digest cache itself shields us from per-retry I/O cost).
+///
+/// 2. **Intent layer enabled** → dict-classify; on miss, optionally
+///    AI-classify. Run the router with the result. The router returns
+///    one of {Text, News, FallbackToLlm}.
+///
+/// 3. **FallbackToLlm OR intent layer disabled** → existing
+///    `ask_with_timeout` path (legacy behaviour).
+///
+/// Cache-write happens at the END, with the FINAL text content, so
+/// even a fallback-to-LLM result gets memoised against the user's
+/// (FromUserName, MsgId) tuple for retry idempotency.
+async fn compute_text_payload(
+    state: &HandlerState,
+    from: &str,
+    user_msg: &str,
+    msg_id: Option<&str>,
+) -> ReplyPayload {
+    let cache_key = msg_id
+        .filter(|s| !s.is_empty())
+        .map(|m| format!("{from}:{m}"));
+
+    // 1. Cache lookup (text-only).
+    if let Some(k) = cache_key.as_deref() {
+        if let Some(cached) = lookup_cached_reply(&state.reply_cache, k) {
+            tracing::info!(cache_key = %k, "returning cached reply (WeChat retry)");
+            return ReplyPayload::Text(cached);
+        }
+    }
+
+    // 2. Intent → Router → optionally LLM tail.
+    let reply = if state.cfg.intent.enabled {
+        let intent = classify_intent(state, user_msg).await;
+        crate::wechat::router::route(&intent, state.digest_cache.snapshot(), &state.cfg.router)
+    } else {
+        // Legacy mode: no intent layer at all → straight to LLM.
+        crate::wechat::router::Reply::FallbackToLlm
+    };
+
+    let payload = match reply {
+        crate::wechat::router::Reply::Text(s) => {
+            ReplyPayload::Text(cap_reply_text(&s, state.cfg.reply.max_chars))
+        }
+        crate::wechat::router::Reply::News(n) => ReplyPayload::News(n),
+        crate::wechat::router::Reply::FallbackToLlm => {
+            let answer = ask_with_timeout(state, from, user_msg).await;
+            ReplyPayload::Text(cap_reply_text(&answer, state.cfg.reply.max_chars))
+        }
+    };
+
+    // 3. Cache write — only text payloads (news is cheap to rebuild).
+    if let (Some(k), ReplyPayload::Text(s)) = (cache_key.as_deref(), &payload) {
+        store_reply(&state.reply_cache, k, s.clone());
+    }
+
+    payload
+}
+
+/// Run dictionary classifier first; fall through to the AI classifier
+/// when configured. Returns `Intent::unknown()` if both stages fail.
+async fn classify_intent(state: &HandlerState, user_msg: &str) -> crate::intent::Intent {
+    if let Some(i) = crate::intent::dict::classify(user_msg, &state.cfg.intent.dict) {
+        return i;
+    }
+    if state.cfg.intent.ai_fallback {
+        if let Some(ai) = state.ai_classifier.as_deref() {
+            return ai.classify(user_msg).await;
+        }
+    }
+    crate::intent::Intent::unknown()
 }
 
 /// Call the bridge with a hard timeout. On timeout, backend failure, or

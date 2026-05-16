@@ -54,6 +54,12 @@ timeout_ms = 4500
 # 高并发场景再加大。每多一个 worker = 多一份 EvoClaw 进程内存开销。
 worker_count = 4
 
+# 启动期 aliveness 检查的宽限期(毫秒)。spawn 后插件等这段时间再检查每个 worker
+# 是否还活着,死了就报错退出(并把子进程 stderr 一起报告出来便于诊断)。
+# 默认 2000ms:覆盖 evoclaw 较慢的冷启动 + 第一次 LLM token 缓存。
+# 部署到快机器上可降到 500ms;evoclaw 加载特别重的状态(大 vault 等)可调到 5000ms。
+startup_grace_ms = 2000
+
 [reply]
 # 超时或后端失败时返回的兜底文案。
 fallback = "我还在想这个问题,请换个简单的问法,或稍后再试一次。"
@@ -72,3 +78,104 @@ max_chars = 600
 [log]
 # trace | debug | info | warn | error
 level = "info"
+
+# ----------------------------------------------------------------------------
+# Digest cache (offline event collection)
+# ----------------------------------------------------------------------------
+# 一个独立的 skill (例如 uae-events-collect) 定时把活动信息写到 data_dir 下,
+# 插件读 latest/data.json 拿事实数据 → 不调 LLM 也能给出准确答案。
+# enabled = false 时插件回退到"全部走 LLM"的老路径(本字段为 OFF 默认值)。
+[digest]
+enabled       = false
+data_dir      = "/tmp/evoclaw/data"
+latest_subdir = "latest"
+data_file     = "data.json"
+meta_file     = "meta.json"
+# 超过这个秒数没更新的 digest 视为过期,插件拒绝服务过期数据。
+max_age_secs  = 129600   # 36 小时
+
+# ----------------------------------------------------------------------------
+# Intent recognition (dict + optional AI fallback)
+# ----------------------------------------------------------------------------
+[intent]
+enabled       = false
+ai_fallback   = true            # dict miss 时跑一次 LLM 分类(JSON 输出)
+ai_timeout_ms = 1500            # 必须 ≤ evoclaw.timeout_ms
+# 覆盖默认 prompt — 留空使用内置默认(见 src/intent/ai.rs::DEFAULT_PROMPT)。
+ai_prompt_override = ""
+
+[intent.dict]
+help_words   = ["菜单", "help", "?", "帮助"]
+action_words = ["活动", "玩的", "节目", "推荐", "去处", "event"]
+
+[[intent.dict.dates]]
+words = ["今天", "今日", "今晚", "today", "tonight"]
+tag   = "today"
+
+[[intent.dict.dates]]
+words = ["明天", "tomorrow"]
+tag   = "tomorrow"
+
+[[intent.dict.dates]]
+words = ["周末", "this weekend", "本周末", "周六", "周日"]
+tag   = "weekend"
+
+[[intent.dict.cities]]
+words = ["迪拜", "Dubai", "DXB"]
+tag   = "Dubai"
+
+[[intent.dict.cities]]
+words = ["阿布扎比", "AbuDhabi", "abu dhabi", "AUH"]
+tag   = "AbuDhabi"
+
+[[intent.dict.cities]]
+words = ["沙迦", "Sharjah", "SHJ"]
+tag   = "Sharjah"
+
+[[intent.dict.categories]]
+words = ["艺术", "展览", "art", "exhibition", "gallery"]
+tag   = "art"
+
+[[intent.dict.categories]]
+words = ["音乐", "演唱会", "concert", "music", "live"]
+tag   = "music"
+
+[[intent.dict.categories]]
+words = ["美食", "餐厅", "food", "dining"]
+tag   = "food"
+
+[[intent.dict.categories]]
+words = ["家庭", "亲子", "family", "kids"]
+tag   = "family"
+
+[[intent.dict.categories]]
+words = ["免费", "free"]
+tag   = "free"
+
+# ----------------------------------------------------------------------------
+# Router (how to turn intent + digest hit into a user-visible reply)
+# ----------------------------------------------------------------------------
+[router]
+help_text         = "支持的问法:\n• 今天/明天/周末活动\n• <城市>活动 (例:迪拜活动)\n• <类别>活动 (例:艺术、音乐、美食)\n• 回复 help 看本菜单"
+unknown_fallback  = "我没太理解 :( 请试试『今天活动』或『迪拜艺术』,或回复 help 查看菜单。"
+empty_result_template = "最近 {days} 天没找到匹配的活动 :("
+events_in_card    = 3
+
+# 图文消息卡片配置。pic_url + url 必须 HTTPS + ICP 备案域名。
+# 留空则 Events 意图也走纯文本回复(LIST 形式),适合还没搭好图床的过渡期。
+[router.news_card]
+pic_url  = ""
+url      = ""
+title_template        = "{date}{city}有 {count} 场活动"
+description_separator = " · "
+description_max_chars = 80
+# 用户没指定城市时 {city} 替换成的字符串。可改成"全境"、"all of UAE"、品牌
+# 名等。留空字符串就让 {city} 渲染为空。
+default_city_label = "UAE"
+
+# 各 DateTag 的用户可见字符串。全部可自定义,改成英文 / 任意语言皆可。
+[router.news_card.date_labels]
+today    = "今天"
+tomorrow = "明天"
+weekend  = "周末"
+week     = "本周"

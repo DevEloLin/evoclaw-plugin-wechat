@@ -16,6 +16,7 @@
 //! caught by a manual smoke test or — worse — a real deployment.
 
 use assert_cmd::cargo::CommandCargoExt;
+use serial_test::serial;
 use sha1::{Digest, Sha1};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -236,6 +237,7 @@ async fn post(
 }
 
 #[tokio::test]
+#[serial]
 async fn round_trip_text_message_returns_passive_reply_xml() {
     let Some(h) = spawn_plugin().await else { return };
     let client = reqwest::Client::new();
@@ -270,6 +272,7 @@ async fn round_trip_text_message_returns_passive_reply_xml() {
 }
 
 #[tokio::test]
+#[serial]
 async fn bad_signature_returns_403() {
     let Some(h) = spawn_plugin().await else { return };
     let client = reqwest::Client::new();
@@ -288,6 +291,7 @@ async fn bad_signature_returns_403() {
 }
 
 #[tokio::test]
+#[serial]
 async fn replayed_nonce_returns_403_on_second_use() {
     let Some(h) = spawn_plugin().await else { return };
     let client = reqwest::Client::new();
@@ -303,6 +307,7 @@ async fn replayed_nonce_returns_403_on_second_use() {
 }
 
 #[tokio::test]
+#[serial]
 async fn ancient_timestamp_returns_403() {
     let Some(h) = spawn_plugin().await else { return };
     let client = reqwest::Client::new();
@@ -322,6 +327,7 @@ async fn ancient_timestamp_returns_403() {
 }
 
 #[tokio::test]
+#[serial]
 async fn msg_id_retry_returns_cached_first_answer() {
     let Some(h) = spawn_plugin().await else { return };
     let client = reqwest::Client::new();
@@ -371,6 +377,7 @@ async fn msg_id_retry_returns_cached_first_answer() {
 }
 
 #[tokio::test]
+#[serial]
 async fn msg_id_cache_is_isolated_per_sender_openid() {
     // Even with an identical `MsgId`, two distinct openids must NOT see
     // each other's cached answer. WeChat documents MsgId as globally
@@ -424,6 +431,7 @@ async fn msg_id_cache_is_isolated_per_sender_openid() {
 }
 
 #[tokio::test]
+#[serial]
 async fn subscribe_event_returns_welcome_text() {
     let Some(h) = spawn_plugin().await else { return };
     let client = reqwest::Client::new();
@@ -449,6 +457,7 @@ async fn subscribe_event_returns_welcome_text() {
 }
 
 #[tokio::test]
+#[serial]
 async fn url_verification_get_echoes_back() {
     let Some(h) = spawn_plugin().await else { return };
     let client = reqwest::Client::new();
