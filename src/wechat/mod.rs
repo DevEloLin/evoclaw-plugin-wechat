@@ -2,5 +2,6 @@
 
 pub mod crypto;
 pub mod handler;
+pub mod router;
 pub mod signature;
 pub mod xml;

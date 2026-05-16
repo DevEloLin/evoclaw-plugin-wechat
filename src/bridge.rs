@@ -38,16 +38,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex as AsyncMutex, RwLock};
 
-/// How long the pool waits after spawning before declaring all bridges
-/// alive. Most fatal startup failures (clap parse errors, missing API
-/// keys at first model touch, panic-in-init) surface inside ~100 ms.
-/// Originally 500 ms, but under heavy parallel test load on macOS a
-/// fresh `sh` invocation can take >500 ms to schedule + run + exit,
-/// which made the aliveness check race the subprocess EOF. 1 s is still
-/// short enough that real users barely notice startup latency, but wide
-/// enough to absorb scheduler jitter on contended CI hosts.
-const STARTUP_ALIVENESS_GRACE: Duration = Duration::from_millis(1000);
-
 /// Bounded ring buffer for stderr capture per bridge. Big enough to keep
 /// the typical clap usage block + stack trace, small enough not to OOM
 /// if EvoClaw goes into a runaway log loop before dying.
@@ -372,7 +362,12 @@ pub struct BridgePool {
 }
 
 impl BridgePool {
-    pub async fn spawn(binary: &str, extra_args: &[String], count: usize) -> Result<Self> {
+    pub async fn spawn(
+        binary: &str,
+        extra_args: &[String],
+        count: usize,
+        startup_grace: Duration,
+    ) -> Result<Self> {
         if count == 0 {
             return Err(PluginError::Config("BridgePool count must be >= 1".into()));
         }
@@ -390,9 +385,8 @@ impl BridgePool {
         // milliseconds. Without this check, the pool happily returns
         // "alive-looking" Bridges that explode on first write; every
         // webhook then falls back to canned text and the user has no
-        // signal at startup that anything is wrong. Sleeping briefly and
-        // re-checking gives us a chance to abort with the actual stderr.
-        tokio::time::sleep(STARTUP_ALIVENESS_GRACE).await;
+        // signal at startup that anything is wrong.
+        tokio::time::sleep(startup_grace).await;
         for (idx, slot) in slots.iter().enumerate() {
             let bridge = slot.read().await.clone();
             if !bridge.is_alive() {
@@ -411,7 +405,7 @@ impl BridgePool {
                      `evoclaw.extra_args` (check `evoclaw channel run \
                      --help` against your binary), or missing API key \
                      for the configured provider.\n{stderr_block}",
-                    grace = STARTUP_ALIVENESS_GRACE.as_millis(),
+                    grace = startup_grace.as_millis(),
                 )));
             }
         }
@@ -701,7 +695,14 @@ mod tests {
         // `evoclaw.extra_args`, evoclaw exits within ms with a clap
         // error. The pool MUST surface this at startup. `false` exits
         // immediately regardless of argv.
-        let err = match BridgePool::spawn("false", &[], 1).await {
+        let err = match BridgePool::spawn(
+            "false",
+            &[],
+            1,
+            Duration::from_millis(500),
+        )
+        .await
+        {
             Ok(_) => panic!("BridgePool::spawn must fail when subprocess dies immediately"),
             Err(e) => e,
         };
@@ -734,10 +735,13 @@ mod tests {
                 return;
             }
         };
-        // Wait up to 2s for the subprocess to die and the stderr task
-        // to drain the captured line into the ring.
+        // Wait up to 5s for the subprocess to die and the stderr task
+        // to drain the captured line into the ring. Generous bound
+        // because parallel test load (other test cases each spinning
+        // up shell scripts) can starve the tokio scheduler enough that
+        // a tight 2s bound flakes intermittently.
         let mut got_stderr = false;
-        for _ in 0..100 {
+        for _ in 0..250 {
             if !bridge.is_alive() && !bridge.recent_stderr().is_empty() {
                 got_stderr = true;
                 break;

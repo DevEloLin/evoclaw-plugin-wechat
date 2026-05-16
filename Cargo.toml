@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eyre = "0.6"
 thiserror = "1"
 async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Crypto stack for 安全模式 / 兼容模式 (AES-256-CBC + PKCS7)
 sha1 = "0.10"
@@ -43,6 +44,12 @@ tempfile = "3"
 # OpenSSL system dep), `assert_cmd` lets us spawn the plugin binary.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 assert_cmd = "2"
+# Each integration test spawns its own plugin instance + Python
+# subprocess; running them in parallel saturates the test host and
+# produces intermittent timeouts. `serial_test` serializes anything
+# marked `#[serial]` to a single global lock — slower wall clock,
+# rock-solid determinism.
+serial_test = "3"
 
 [profile.release]
 lto = "thin"

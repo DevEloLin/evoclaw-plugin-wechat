@@ -5,7 +5,7 @@
 use crate::error::{PluginError, Result};
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -17,6 +17,20 @@ pub struct Config {
     pub reply: ReplyCfg,
     #[serde(default)]
     pub log: LogCfg,
+    /// Cached event digest written periodically by an offline skill.
+    /// When `enabled = false`, every text message falls through to the
+    /// LLM tail — the plugin behaves exactly like before the digest
+    /// fast-path was added.
+    #[serde(default)]
+    pub digest: DigestCfg,
+    /// Intent recognition (dictionary + optional AI fallback). Drives
+    /// which `digest` rows get surfaced to the user.
+    #[serde(default)]
+    pub intent: IntentCfg,
+    /// How to format a user-visible reply once an intent + matching
+    /// digest rows have been resolved.
+    #[serde(default)]
+    pub router: RouterCfg,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +76,15 @@ pub struct EvoclawCfg {
     pub timeout_ms: u64,
     #[serde(default = "default_workers")]
     pub worker_count: usize,
+    /// How long the pool waits after spawning before declaring all
+    /// bridges alive. Most fatal startup failures (clap parse errors,
+    /// missing API keys) surface inside ~100 ms — but on contended
+    /// hosts (heavy CI parallelism, macOS Spotlight indexing, low
+    /// memory) a slow Python/shell startup can take >1 s. 2 s is a
+    /// safe default; tune down to 500 ms for fast-boot servers and up
+    /// to 5000 ms if your evoclaw binary loads heavy state.
+    #[serde(default = "default_startup_grace_ms")]
+    pub startup_grace_ms: u64,
 }
 
 impl Default for EvoclawCfg {
@@ -71,6 +94,7 @@ impl Default for EvoclawCfg {
             extra_args: Vec::new(),
             timeout_ms: default_timeout(),
             worker_count: default_workers(),
+            startup_grace_ms: default_startup_grace_ms(),
         }
     }
 }
@@ -89,6 +113,9 @@ fn default_workers() -> usize {
     // personal/SMB public accounts; bump higher if you expect concurrent
     // bursts.
     4
+}
+fn default_startup_grace_ms() -> u64 {
+    2000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +162,327 @@ pub struct LogCfg {
 
 fn default_log_level() -> String {
     "info".into()
+}
+
+// ---------------------------------------------------------------------------
+// [digest]
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DigestCfg {
+    /// When false, the digest cache is never consulted and every text
+    /// message falls through to the LLM (legacy behaviour).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Filesystem base where the offline skill writes its output. The
+    /// plugin looks for `<data_dir>/<latest_subdir>/<entry_files>`.
+    #[serde(default = "default_digest_data_dir")]
+    pub data_dir: PathBuf,
+    /// Symlink (or directory name) under `data_dir` that always points
+    /// at the freshest digest. The skill updates this atomically after
+    /// it finishes writing a new day's snapshot.
+    #[serde(default = "default_digest_latest_subdir")]
+    pub latest_subdir: String,
+    /// File name inside the latest dir holding the structured event
+    /// list (the JSON the plugin actually parses).
+    #[serde(default = "default_digest_data_file")]
+    pub data_file: String,
+    /// File name inside the latest dir holding the metadata envelope.
+    /// Plugin reads `version` + `generated_at` from here for schema
+    /// gating and staleness checks.
+    #[serde(default = "default_digest_meta_file")]
+    pub meta_file: String,
+    /// Maximum age in seconds before the digest is considered stale.
+    /// Past this point, the plugin refuses to serve cached answers and
+    /// returns `router.unknown_fallback` — better than answering with
+    /// silently outdated data.
+    #[serde(default = "default_digest_max_age_secs")]
+    pub max_age_secs: u64,
+}
+
+impl Default for DigestCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_dir: default_digest_data_dir(),
+            latest_subdir: default_digest_latest_subdir(),
+            data_file: default_digest_data_file(),
+            meta_file: default_digest_meta_file(),
+            max_age_secs: default_digest_max_age_secs(),
+        }
+    }
+}
+
+fn default_digest_data_dir() -> PathBuf {
+    PathBuf::from("/tmp/evoclaw/data")
+}
+fn default_digest_latest_subdir() -> String {
+    "latest".into()
+}
+fn default_digest_data_file() -> String {
+    "data.json".into()
+}
+fn default_digest_meta_file() -> String {
+    "meta.json".into()
+}
+fn default_digest_max_age_secs() -> u64 {
+    // 36 hours: tolerates one missed daily cron run, refuses earlier
+    // than that. Set lower for tighter freshness expectations.
+    36 * 3600
+}
+
+// ---------------------------------------------------------------------------
+// [intent]
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntentCfg {
+    /// When false, the intent layer is bypassed entirely (no
+    /// dictionary, no AI). Every text message goes to LLM tail.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Try the AI classifier when the dictionary doesn't match. When
+    /// false, dictionary misses go straight to `router.unknown_fallback`
+    /// — strictest accuracy mode but lowest recall.
+    #[serde(default = "default_intent_ai_fallback")]
+    pub ai_fallback: bool,
+    /// Hard timeout for the AI classifier round-trip. Should be small
+    /// (≤ 2 s) so a slow LLM doesn't eat the whole WeChat 5 s budget
+    /// before we even reach the digest lookup.
+    #[serde(default = "default_intent_ai_timeout_ms")]
+    pub ai_timeout_ms: u64,
+    /// Override the AI classifier's system prompt. Empty = use built-in
+    /// default (see `intent::ai`). Provide your own if you want a
+    /// different intent taxonomy or a different language style.
+    #[serde(default)]
+    pub ai_prompt_override: String,
+    /// Word-list driven matcher run first. Everything here is
+    /// data — no behaviour is encoded in code paths.
+    #[serde(default)]
+    pub dict: IntentDictCfg,
+}
+
+impl Default for IntentCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ai_fallback: default_intent_ai_fallback(),
+            ai_timeout_ms: default_intent_ai_timeout_ms(),
+            ai_prompt_override: String::new(),
+            dict: IntentDictCfg::default(),
+        }
+    }
+}
+
+fn default_intent_ai_fallback() -> bool {
+    true
+}
+fn default_intent_ai_timeout_ms() -> u64 {
+    1500
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct IntentDictCfg {
+    /// Words that, if any appear in the user message, route directly
+    /// to `router.help_text` regardless of anything else.
+    #[serde(default)]
+    pub help_words: Vec<String>,
+    /// At least one of these must appear in the message for the
+    /// dictionary to classify the intent as "Events". Otherwise the
+    /// dictionary returns no match and (if `ai_fallback` is on) the
+    /// AI classifier takes over.
+    #[serde(default)]
+    pub action_words: Vec<String>,
+    #[serde(default)]
+    pub dates: Vec<TagWords>,
+    #[serde(default)]
+    pub cities: Vec<TagWords>,
+    #[serde(default)]
+    pub categories: Vec<TagWords>,
+    #[serde(default)]
+    pub times: Vec<TagWords>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TagWords {
+    /// Surface forms the user might type — matched as case-insensitive
+    /// substrings on the user message.
+    pub words: Vec<String>,
+    /// Canonical tag emitted when any of `words` matches. Must agree
+    /// with the same tag used in the digest's structured data file
+    /// (otherwise the lookup will silently miss every event).
+    pub tag: String,
+}
+
+// ---------------------------------------------------------------------------
+// [router]
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouterCfg {
+    /// Returned verbatim when intent kind = Help (i.e. user typed
+    /// something matched by `intent.dict.help_words`, or AI returned
+    /// `"help"`).
+    #[serde(default = "default_router_help_text")]
+    pub help_text: String,
+    /// Returned verbatim when intent recognition completely failed —
+    /// neither dict nor AI could classify, AND the digest stale guard
+    /// kicked in. The "I don't understand, try X or Y" prompt.
+    #[serde(default = "default_router_unknown_fallback")]
+    pub unknown_fallback: String,
+    /// Template returned when intent classified as Events but the
+    /// digest query found zero matching rows. Supports `{days}`
+    /// placeholder — substituted with the digest's `days_covered`.
+    #[serde(default = "default_router_empty_result_template")]
+    pub empty_result_template: String,
+    /// Maximum number of events to surface in a single news card's
+    /// description. Beyond this the description gets truncated with
+    /// `…`. Keeps the WeChat card readable.
+    #[serde(default = "default_router_events_in_card")]
+    pub events_in_card: usize,
+    /// News-card metadata for image+text passive replies.
+    #[serde(default)]
+    pub news_card: NewsCardCfg,
+}
+
+impl Default for RouterCfg {
+    fn default() -> Self {
+        Self {
+            help_text: default_router_help_text(),
+            unknown_fallback: default_router_unknown_fallback(),
+            empty_result_template: default_router_empty_result_template(),
+            events_in_card: default_router_events_in_card(),
+            news_card: NewsCardCfg::default(),
+        }
+    }
+}
+
+fn default_router_help_text() -> String {
+    "支持的问法:\n\
+     • 今天/明天/周末活动\n\
+     • <城市>活动 (如:迪拜活动)\n\
+     • <类别>活动 (如:艺术展、音乐演出)\n\
+     • 回复 help 看本菜单"
+        .into()
+}
+fn default_router_unknown_fallback() -> String {
+    "我没太理解 :( 请试试『今天活动』或『迪拜艺术』,或回复 help 查看菜单。".into()
+}
+fn default_router_empty_result_template() -> String {
+    "最近 {days} 天没找到匹配的活动 :(".into()
+}
+fn default_router_events_in_card() -> usize {
+    3
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewsCardCfg {
+    /// HTTPS URL of the cover image WeChat renders on the card.
+    /// MUST be on an ICP-filed domain (WeChat enforces this for
+    /// the image fetch). Leave empty to suppress news cards entirely
+    /// — the router will fall back to plain text replies even for
+    /// Events intent.
+    #[serde(default)]
+    pub pic_url: String,
+    /// HTTPS URL the user lands on after tapping the card. Should
+    /// point at a human-readable rendering of the same digest
+    /// (Markdown / HTML). Same ICP requirement as `pic_url`.
+    #[serde(default)]
+    pub url: String,
+    /// Template for the card title. Available placeholders:
+    ///   {count} → number of matching events
+    ///   {city}  → city tag if filter has one, else `default_city_label`
+    ///   {date}  → date label (today / tomorrow / weekend / week)
+    /// Free-form text outside placeholders is preserved verbatim.
+    #[serde(default = "default_news_title_template")]
+    pub title_template: String,
+    /// String inserted between event titles in the description body.
+    #[serde(default = "default_news_description_separator")]
+    pub description_separator: String,
+    /// Maximum character (not byte) length of the assembled
+    /// description before it's truncated with `…`.
+    #[serde(default = "default_news_description_max_chars")]
+    pub description_max_chars: usize,
+    /// Substituted for `{city}` when the user didn't specify a city
+    /// filter. Common values: "UAE" / "全境" / "all of UAE" / etc.
+    /// Empty string is allowed (renders as just `{date}{count}…`).
+    #[serde(default = "default_news_default_city_label")]
+    pub default_city_label: String,
+    /// Localized strings substituted for `{date}` per canonical
+    /// `DateTag`. Each field is independent — leaving any empty
+    /// makes that branch render as no prefix.
+    #[serde(default)]
+    pub date_labels: DateLabelsCfg,
+}
+
+/// User-visible labels for each canonical date bucket. Every field is
+/// a free-form string the operator can rewrite for localization /
+/// brand voice (e.g. "this evening" vs "今晚").
+#[derive(Debug, Clone, Deserialize)]
+pub struct DateLabelsCfg {
+    #[serde(default = "default_date_label_today")]
+    pub today: String,
+    #[serde(default = "default_date_label_tomorrow")]
+    pub tomorrow: String,
+    #[serde(default = "default_date_label_weekend")]
+    pub weekend: String,
+    #[serde(default = "default_date_label_week")]
+    pub week: String,
+}
+
+impl Default for DateLabelsCfg {
+    fn default() -> Self {
+        Self {
+            today: default_date_label_today(),
+            tomorrow: default_date_label_tomorrow(),
+            weekend: default_date_label_weekend(),
+            week: default_date_label_week(),
+        }
+    }
+}
+
+fn default_date_label_today() -> String {
+    "今天".into()
+}
+fn default_date_label_tomorrow() -> String {
+    "明天".into()
+}
+fn default_date_label_weekend() -> String {
+    "周末".into()
+}
+fn default_date_label_week() -> String {
+    "本周".into()
+}
+fn default_news_default_city_label() -> String {
+    "UAE".into()
+}
+
+fn default_news_title_template() -> String {
+    "{date}{city}有 {count} 场活动".into()
+}
+fn default_news_description_separator() -> String {
+    " · ".into()
+}
+fn default_news_description_max_chars() -> usize {
+    80
+}
+
+impl Default for NewsCardCfg {
+    fn default() -> Self {
+        Self {
+            // Empty URLs signal "no news card" — the router will fall
+            // back to plain-text replies even for Events intents,
+            // which is the right thing for users who haven't yet set
+            // up image hosting.
+            pic_url: String::new(),
+            url: String::new(),
+            title_template: default_news_title_template(),
+            description_separator: default_news_description_separator(),
+            description_max_chars: default_news_description_max_chars(),
+            default_city_label: default_news_default_city_label(),
+            date_labels: DateLabelsCfg::default(),
+        }
+    }
 }
 
 impl Config {
@@ -191,6 +539,101 @@ impl Config {
                 "reply.max_chars must be >= 1 (recommended 600 for safe WeChat byte budget)"
                     .into(),
             ));
+        }
+
+        // ----- [digest] -----
+        if self.digest.enabled {
+            if self.digest.data_dir.as_os_str().is_empty() {
+                return Err(PluginError::Config(
+                    "digest.data_dir must be non-empty when digest.enabled = true".into(),
+                ));
+            }
+            if self.digest.latest_subdir.is_empty() {
+                return Err(PluginError::Config(
+                    "digest.latest_subdir must be non-empty".into(),
+                ));
+            }
+            if self.digest.max_age_secs == 0 {
+                return Err(PluginError::Config(
+                    "digest.max_age_secs must be >= 1 (recommended 36*3600 = 129600)".into(),
+                ));
+            }
+        }
+
+        // ----- [intent] -----
+        if self.intent.enabled {
+            // Sanity-check timeout — must leave room for everything else
+            // inside the per-request budget (`evoclaw.timeout_ms`).
+            if self.intent.ai_timeout_ms == 0 || self.intent.ai_timeout_ms > self.evoclaw.timeout_ms
+            {
+                return Err(PluginError::Config(format!(
+                    "intent.ai_timeout_ms ({}) must be 1..={} (i.e. ≤ evoclaw.timeout_ms)",
+                    self.intent.ai_timeout_ms, self.evoclaw.timeout_ms,
+                )));
+            }
+            // If dict is completely empty AND ai_fallback is off, the
+            // intent layer can never match anything — that's certainly a
+            // misconfiguration, never the user's intent.
+            let dict_empty = self.intent.dict.help_words.is_empty()
+                && self.intent.dict.action_words.is_empty()
+                && self.intent.dict.dates.is_empty()
+                && self.intent.dict.cities.is_empty()
+                && self.intent.dict.categories.is_empty()
+                && self.intent.dict.times.is_empty();
+            if dict_empty && !self.intent.ai_fallback {
+                return Err(PluginError::Config(
+                    "intent.enabled = true but dictionary is empty AND ai_fallback = false — \
+                     the intent layer can never match anything in this configuration"
+                        .into(),
+                ));
+            }
+            // Every TagWords entry must be non-trivial.
+            for (section, list) in [
+                ("dates", &self.intent.dict.dates),
+                ("cities", &self.intent.dict.cities),
+                ("categories", &self.intent.dict.categories),
+                ("times", &self.intent.dict.times),
+            ] {
+                for (i, tw) in list.iter().enumerate() {
+                    if tw.tag.is_empty() {
+                        return Err(PluginError::Config(format!(
+                            "intent.dict.{section}[{i}].tag must be non-empty"
+                        )));
+                    }
+                    if tw.words.is_empty() {
+                        return Err(PluginError::Config(format!(
+                            "intent.dict.{section}[{i}].words must be non-empty"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // ----- [router] -----
+        if self.router.events_in_card == 0 {
+            return Err(PluginError::Config(
+                "router.events_in_card must be >= 1".into(),
+            ));
+        }
+        if self.router.news_card.description_max_chars == 0 {
+            return Err(PluginError::Config(
+                "router.news_card.description_max_chars must be >= 1".into(),
+            ));
+        }
+        // Image URL is optional (empty = no news card, plain text only).
+        // But if set, must be HTTPS.
+        let news = &self.router.news_card;
+        if !news.pic_url.is_empty() && !news.pic_url.starts_with("https://") {
+            return Err(PluginError::Config(format!(
+                "router.news_card.pic_url '{}' must be HTTPS",
+                news.pic_url
+            )));
+        }
+        if !news.url.is_empty() && !news.url.starts_with("https://") {
+            return Err(PluginError::Config(format!(
+                "router.news_card.url '{}' must be HTTPS",
+                news.url
+            )));
         }
         Ok(())
     }
