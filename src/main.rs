@@ -231,13 +231,16 @@ async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
     // small (~current-active-fans size) because idle entries get
     // evicted. We clamp gc_interval_secs to >=60 so a tiny misconfig
     // can't make us busy-sweep.
-    if cfg.session.dir.is_some() {
-        let gc_serializer = state.conv_serializer.clone();
-        // Clamp gc_interval to ≥60s to prevent a busy-spin from a tiny
-        // misconfig. Warn loudly if we had to clamp so the operator
-        // discovers it in the logs instead of being silently overruled.
+    // GC task: always on so the reply-idempotency and nonce-replay
+    // caches don't bloat after a burst-then-idle pattern (their
+    // retain-on-access policy alone leaves 100k+ stale entries pinned
+    // in memory until the NEXT request arrives, sometimes hours later).
+    // When `[session].dir` is set, the same task also sweeps the
+    // per-cid mutex map maintained by `ConvSerializer`.
+    {
         const MIN_GC_INTERVAL_SECS: u64 = 60;
-        if cfg.session.gc_interval_secs < MIN_GC_INTERVAL_SECS {
+        // Clamp + warn if operator configured a too-small interval.
+        if cfg.session.dir.is_some() && cfg.session.gc_interval_secs < MIN_GC_INTERVAL_SECS {
             tracing::warn!(
                 configured = cfg.session.gc_interval_secs,
                 clamped = MIN_GC_INTERVAL_SECS,
@@ -247,18 +250,26 @@ async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
         let gc_interval =
             std::time::Duration::from_secs(cfg.session.gc_interval_secs.max(MIN_GC_INTERVAL_SECS));
         let gc_idle = std::time::Duration::from_secs(cfg.session.cid_lock_idle_secs);
+        let sweep_conv_serializer = cfg.session.dir.is_some();
+        let gc_state = state.clone();
         tokio::spawn(async move {
-            // Use a tokio interval so we self-correct after long pauses
-            // (e.g. laptop sleep) instead of doing one sweep and dying.
             let mut interval = tokio::time::interval(gc_interval);
-            // Skip the first immediate tick — process just started, map
-            // is empty. Without this we'd burn one log line at boot.
-            interval.tick().await;
+            interval.tick().await; // skip immediate first tick
             loop {
                 interval.tick().await;
-                let evicted = gc_serializer.gc(gc_idle);
-                if evicted > 0 {
-                    tracing::debug!(evicted, "conv_serializer: gc swept idle cid locks");
+                let (reply_evicted, nonce_evicted) = gc_state.gc_caches();
+                if reply_evicted + nonce_evicted > 0 {
+                    tracing::debug!(
+                        reply_evicted,
+                        nonce_evicted,
+                        "handler: gc swept expired cache entries"
+                    );
+                }
+                if sweep_conv_serializer {
+                    let cid_evicted = gc_state.conv_serializer.gc(gc_idle);
+                    if cid_evicted > 0 {
+                        tracing::debug!(cid_evicted, "conv_serializer: gc swept idle cid locks");
+                    }
                 }
             }
         });
