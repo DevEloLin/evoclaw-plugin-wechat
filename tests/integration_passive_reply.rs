@@ -372,6 +372,59 @@ async fn msg_id_retry_returns_cached_first_answer() {
 }
 
 #[tokio::test]
+async fn msg_id_cache_is_isolated_per_sender_openid() {
+    // Even with an identical `MsgId`, two distinct openids must NOT see
+    // each other's cached answer. WeChat documents MsgId as globally
+    // unique, but the plugin's cache key still composes `{from}:{msg_id}`
+    // defensively. Verifies that contract end-to-end.
+    let Some(h) = spawn_plugin().await else { return };
+    let client = reqwest::Client::new();
+    let shared_msg_id = "collision-mid";
+
+    // Alice → first answer ALPHA
+    let ts1 = now_unix_secs();
+    let nonce1 = unique_nonce();
+    let sig1 = plain_signature(TOKEN, &ts1, &nonce1);
+    let r_alice = post(
+        &client,
+        &h,
+        &sig1,
+        &ts1,
+        &nonce1,
+        text_body("alice-says-ALPHA", shared_msg_id, &ts1, "oUserAlice"),
+    )
+    .await;
+    assert_eq!(r_alice.status(), 200);
+    let body_alice = r_alice.text().await.unwrap();
+    assert!(body_alice.contains("echo: alice-says-ALPHA"));
+
+    // Bob with the SAME msg_id but different openid. The fake-evoclaw
+    // echo confirms the subprocess was invoked (i.e. cache MISS for Bob).
+    let ts2 = now_unix_secs();
+    let nonce2 = unique_nonce();
+    let sig2 = plain_signature(TOKEN, &ts2, &nonce2);
+    let r_bob = post(
+        &client,
+        &h,
+        &sig2,
+        &ts2,
+        &nonce2,
+        text_body("bob-says-BRAVO", shared_msg_id, &ts2, "oUserBob"),
+    )
+    .await;
+    assert_eq!(r_bob.status(), 200);
+    let body_bob = r_bob.text().await.unwrap();
+    assert!(
+        body_bob.contains("echo: bob-says-BRAVO"),
+        "Bob must see HIS OWN echoed payload, not Alice's cached answer. got: {body_bob}"
+    );
+    assert!(
+        !body_bob.contains("alice-says-ALPHA"),
+        "Bob MUST NOT see Alice's payload: {body_bob}"
+    );
+}
+
+#[tokio::test]
 async fn subscribe_event_returns_welcome_text() {
     let Some(h) = spawn_plugin().await else { return };
     let client = reqwest::Client::new();

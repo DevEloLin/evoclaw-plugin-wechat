@@ -226,15 +226,24 @@ async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: boo
                 // first deadline would be triggered AGAIN by the retry
                 // (and again by the next retry) — wasting tokens and
                 // potentially returning out-of-order results.
+                //
+                // Cache key is `{FromUserName}:{MsgId}` — never bare MsgId.
+                // WeChat documents MsgId as globally unique, but binding the
+                // entry to the sender openid is a defensive guarantee that
+                // a (vanishingly unlikely) cross-user MsgId collision cannot
+                // leak one user's answer to another. openids never contain
+                // `:` and msg_ids are decimal digits, so the separator is
+                // unambiguous.
                 let msg_id = inbound.msg_id.as_deref().unwrap_or("");
                 if !msg_id.is_empty() {
-                    if let Some(cached) = lookup_cached_reply(&state.reply_cache, msg_id) {
-                        tracing::info!(msg_id, "returning cached reply (WeChat retry)");
+                    let cache_key = format!("{from}:{msg_id}");
+                    if let Some(cached) = lookup_cached_reply(&state.reply_cache, &cache_key) {
+                        tracing::info!(msg_id, sender = %from, "returning cached reply (WeChat retry)");
                         Some(cached)
                     } else {
                         let answer = ask_with_timeout(state, &from, &user_msg).await;
                         let capped = cap_reply_text(&answer, cfg.reply.max_chars);
-                        store_reply(&state.reply_cache, msg_id, capped.clone());
+                        store_reply(&state.reply_cache, &cache_key, capped.clone());
                         Some(capped)
                     }
                 } else {
@@ -521,6 +530,27 @@ mod tests {
     fn reply_cache_miss_returns_none() {
         let cache = fresh_reply_cache();
         assert!(lookup_cached_reply(&cache, "never-seen").is_none());
+    }
+
+    #[test]
+    fn reply_cache_does_not_leak_across_users_with_same_msg_id() {
+        // Defensive: cache keys must be composite `{from}:{msg_id}` so a
+        // hypothetical MsgId collision between two distinct senders can
+        // never serve one user's answer to the other. Mirrors the keying
+        // in `dispatch_and_reply` exactly.
+        let cache = fresh_reply_cache();
+        let msg_id = "shared-msg-id";
+        store_reply(&cache, &format!("oUserAlice:{msg_id}"), "answer-for-alice".into());
+        // Bob's key is different — must miss even though `msg_id` matches.
+        assert!(
+            lookup_cached_reply(&cache, &format!("oUserBob:{msg_id}")).is_none(),
+            "cache MUST NOT return Alice's answer when keyed for Bob"
+        );
+        // Alice's own retry must hit.
+        assert_eq!(
+            lookup_cached_reply(&cache, &format!("oUserAlice:{msg_id}")).as_deref(),
+            Some("answer-for-alice"),
+        );
     }
 
     #[test]
