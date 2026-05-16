@@ -31,6 +31,12 @@ pub struct Config {
     /// digest rows have been resolved.
     #[serde(default)]
     pub router: RouterCfg,
+    /// Per-conversation history persistence. When `dir` is `None` the
+    /// plugin runs in legacy stateless mode (every message LLM-fresh);
+    /// when set, EvoClaw is invoked with `--session-dir <dir>` and each
+    /// WeChat fan gets their own jsonl history.
+    #[serde(default)]
+    pub session: SessionCfg,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -501,6 +507,65 @@ impl Default for NewsCardCfg {
     }
 }
 
+// ---------------------------------------------------------------------------
+// [session]
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionCfg {
+    /// Root directory under which per-cid jsonl files live. When
+    /// `None`, multi-turn memory is disabled (back-compat default).
+    /// Recommended path: `/var/lib/evoclaw/sessions`.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Max user/assistant turn pairs retained per cid. Older pairs are
+    /// dropped on write. Bump this if your prompts are short and you
+    /// want longer memory; lower it if your LLM has a tight context
+    /// window (e.g. Azure default TPM tier).
+    #[serde(default = "default_session_max_turns")]
+    pub max_turns: u32,
+    /// Advisory expiry in days. Stored only as metadata for an external
+    /// GC tool; the plugin itself does not delete on its own — see
+    /// `docs/USAGE.md` for the cron snippet.
+    #[serde(default = "default_session_ttl_days")]
+    pub ttl_days: u32,
+    /// Background sweep interval (seconds) for the in-memory per-cid
+    /// mutex map. The sweep evicts idle entries so the map stays
+    /// bounded under high user churn. Independent of disk GC.
+    #[serde(default = "default_session_gc_interval_secs")]
+    pub gc_interval_secs: u64,
+    /// How long a cid lock entry can sit unused before it's eligible for
+    /// eviction by the background sweep. Entries with an active hold
+    /// are kept regardless.
+    #[serde(default = "default_session_cid_lock_idle_secs")]
+    pub cid_lock_idle_secs: u64,
+}
+
+impl Default for SessionCfg {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            max_turns: default_session_max_turns(),
+            ttl_days: default_session_ttl_days(),
+            gc_interval_secs: default_session_gc_interval_secs(),
+            cid_lock_idle_secs: default_session_cid_lock_idle_secs(),
+        }
+    }
+}
+
+fn default_session_max_turns() -> u32 {
+    20
+}
+fn default_session_ttl_days() -> u32 {
+    30
+}
+fn default_session_gc_interval_secs() -> u64 {
+    3600
+}
+fn default_session_cid_lock_idle_secs() -> u64 {
+    300
+}
+
 impl Config {
     pub async fn from_path(path: &Path) -> Result<Self> {
         let text = tokio::fs::read_to_string(path).await?;
@@ -653,6 +718,24 @@ impl Config {
                 "router.news_card.url '{}' must be HTTPS",
                 news.url
             )));
+        }
+
+        // ----- [session] -----
+        if let Some(dir) = &self.session.dir {
+            if dir.as_os_str().is_empty() {
+                return Err(PluginError::Config(
+                    "session.dir must be non-empty when set".into(),
+                ));
+            }
+            if self.session.max_turns == 0 {
+                return Err(PluginError::Config("session.max_turns must be >= 1".into()));
+            }
+            if self.session.ttl_days == 0 {
+                return Err(PluginError::Config("session.ttl_days must be >= 1".into()));
+            }
+            // gc_interval_secs is clamped (not rejected) at runtime to >=60s
+            // so a tiny mis-config doesn't busy-spin the GC. Cid lock idle
+            // can validly be 0 (immediate eviction), so we don't gate it.
         }
         Ok(())
     }

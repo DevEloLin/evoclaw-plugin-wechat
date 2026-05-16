@@ -622,12 +622,125 @@ title_template = "{date}{country}{city}有 {count} 场活动"
 见 `config.example.toml`,已经包含 UAE + Turkey + Nepal 的最小 dict 配置。
 所有维度都可以无限扩展,**插件代码不需要任何改动**。
 
+## 多轮会话与用户隔离
+
+让每位 WeChat 粉丝拥有持久独立的对话上下文,而 EvoClaw 后端进程池仍然是
+**共享、有限规模**(典型 8 核 32 worker 服务 10 万级注册用户)。
+
+### 工作原理
+
+```
+WeChat POST → 插件签名校验 → 抽取 from_user
+                                   ↓
+              cid = "wx-{app_id}-{from_user}"
+                                   ↓
+        ConvSerializer.acquire(cid).lock().await   ← 同一用户串行
+                                   ↓
+              BridgePool.checkout()                ← 任一空闲 worker
+                                   ↓
+        evoclaw channel run --session-dir <dir>    ← 自动注入
+                ├─ load sessions/{shard}/{cid}.jsonl
+                ├─ 拼成 LLM history,调模型
+                ├─ truncate 到 max_turns
+                └─ atomic rename 写回
+                                   ↓
+                  释放 cid 锁 + 还 worker
+```
+
+### 启用方式
+
+在 `wechat.toml` 加 `[session]` 段(详见 `config.example.toml`):
+
+```toml
+[session]
+dir       = "/var/lib/evoclaw/sessions"
+max_turns = 20
+ttl_days  = 30
+```
+
+部署:
+
+```bash
+sudo mkdir -p /var/lib/evoclaw/sessions
+sudo chown ${USER}:${USER} /var/lib/evoclaw/sessions
+sudo chmod 700 /var/lib/evoclaw/sessions
+```
+
+插件启动时会自动给每个 evoclaw 子进程追加
+`--session-dir /var/lib/evoclaw/sessions --session-max-turns 20 --session-ttl-days 30`,
+不需要你手动写到 `evoclaw.extra_args` 里。
+
+### 容量与磁盘估算
+
+- 单用户 ~50 KB(20 轮中文消息,jsonl 含 system prompt + tool messages)
+- 10 万注册用户 ≈ 5 GB 磁盘,256 shard 平均 400 文件/目录(ext4/apfs 都很轻松)
+- 文件路径:`/var/lib/evoclaw/sessions/{shard}/{cid}.jsonl`
+  - `shard` = `sha1(cid)[:2]`(两位小写 hex)
+  - `cid` = `wx-{app_id}-{from_user_openid}`
+
+### 操作手册
+
+**手动查看某用户历史**:
+
+```bash
+CID="wx-wx_youraccount-oXXXXXXX..."
+SHARD=$(echo -n "$CID" | shasum | cut -c1-2)
+cat /var/lib/evoclaw/sessions/$SHARD/$CID.jsonl | jq .
+```
+
+**单用户右键"被遗忘"(GDPR)**:
+
+```bash
+rm -f /var/lib/evoclaw/sessions/$SHARD/$CID.jsonl
+```
+
+**清理 30 天未活跃用户**(配 cron daily):
+
+```bash
+find /var/lib/evoclaw/sessions -mindepth 2 -name '*.jsonl' -mtime +30 -delete
+find /var/lib/evoclaw/sessions -mindepth 2 -name '.*.tmp.*' -mtime +1 -delete  # 残留临时文件
+```
+
+**`ic-*` 文件(intent 分类临时文件)**:每次 AI 意图分类会产生一个一次性 cid,
+持续累积会占磁盘。建议每周清理一次:
+
+```bash
+find /var/lib/evoclaw/sessions -name 'ic-*.jsonl' -mtime +7 -delete
+```
+
+### `max_turns` 调优
+
+| LLM 配额情况 | 建议 `max_turns` | 理由 |
+|---|---|---|
+| Azure 默认 gpt-4o (30K TPM) | **5–8** | 每次请求 ~3-4K tokens,30K TPM = 7-10 req/min,降短上下文才能撑住 |
+| Azure 提到 1M+ TPM | **10–15** | 余量充足,可以保留更长记忆 |
+| Claude Tier 3 (400 RPM) | **15–20** | RPM 而非 TPM 限制,长度自由 |
+| 自建 vLLM / 无配额限制 | **20–30** | 用户体验最好 |
+
+写完改 `max_turns` 不需要重启 — 下次 evoclaw worker 重启时新值生效。
+活的进程仍用旧值,但不会出现"半旧半新"的不一致。
+
+### 失败模式
+
+- **worker 中途崩溃**:bridge 检测到 EOF → 标记死亡 → 下条消息触发 respawn。
+  jsonl 用 atomic rename 写入,绝不会留半截。
+- **jsonl 单行损坏**:`SessionStore::load` 跳过坏行 + `WARN` 日志,继续加载剩下的。
+  下次写回会覆盖整个文件,自动修复。
+- **磁盘满**:写失败 → 用户本轮拿到正常 LLM 回复(已先回复才写盘)→ 下轮回退到空历史。
+- **同用户消息洪水**:第二条消息等第一条完成或超时(4.5s 上限)。比并发安全更重要。
+
+### 不在此版本内的能力(P2)
+
+- 多机部署共享会话(需要 Redis 分布式锁 + 共享 FS 适配器)
+- 历史摘要(让 max_turns 之外的记忆通过总结保留)
+- 按用户 persona / system prompt
+- 加密静默存储
+
 ## 已知限制
 
 | 限制 | 状态 |
 |---|---|
 | 5 秒响应窗口(微信硬约束) | 永久 — 改用客服消息异步推送需要微信认证 |
-| 多轮对话上下文不跨消息保留 | v0.1 待办,需要 EvoClaw `channel run` 支持 per-conversation history |
 | 不处理 image / voice / video 入站消息 | 当前静默 ack,扩展 `handler.rs` 即可 |
 | 没有 prometheus metrics | 待办 |
 | Linux/macOS only(用了 `kill_on_drop`、Unix 文件权限) | Windows 支持待办 |

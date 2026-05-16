@@ -228,3 +228,37 @@ today    = "今天"
 tomorrow = "明天"
 weekend  = "周末"
 week     = "本周"
+
+# ----------------------------------------------------------------------------
+# [session] — 多轮会话 & 每用户独立上下文
+# ----------------------------------------------------------------------------
+# 这是把"AI 公众号"从"一次性问答机"变成"能记住用户上下文的助手"的关键开关。
+#
+# 工作原理:
+#   - 插件给每位 WeChat 粉丝生成稳定的 conversation_id = "wx-{app_id}-{openid}"
+#   - 同一 cid 下所有消息共享一个 jsonl 文件,文件路径 = dir/{shard}/{cid}.jsonl
+#     其中 shard = sha1(cid)[:2] (256 个子目录,防 10 万用户挤一个目录)
+#   - EvoClaw 收到消息时先 load 该用户的 jsonl 历史,拼到 LLM 上下文中调模型,
+#     收到回复后原子写回(临时文件 + rename),崩溃也不会留半截
+#   - 同一用户两条消息靠插件内 per-cid Mutex 串行,绝不并发污染同一 jsonl
+#   - 不同用户完全并行,只受 worker_count 限制
+#
+# 留空 dir 字段 = 关闭(回退到无状态行为,等同没接此功能)。
+[session]
+# jsonl 持久化根目录。推荐生产用 /var/lib/evoclaw/sessions 并 chown 给插件用户。
+# 留空字符串等价于不写本字段 = 关闭多轮会话。
+# dir = "/var/lib/evoclaw/sessions"
+
+# 每用户保留多少轮 user/assistant 对。20 轮 ≈ 单文件 50KB ≈ 10 万用户 5GB 磁盘。
+# 降到 10 会让超长上下文用户的 LLM 调用更便宜更快,代价是"记忆窗口"短一半。
+max_turns = 20
+
+# 用户多少天没说话就视为可以重置该用户上下文。本插件不直接删,
+# 用 cron 配合 find: `find /var/lib/evoclaw/sessions -mtime +30 -name '*.jsonl' -delete`
+ttl_days = 30
+
+# per-cid Mutex 表的后台 GC 间隔(秒)。最小 60。维持内存占用界。
+gc_interval_secs = 3600
+
+# cid 锁条目空闲多少秒后允许被 GC 回收。运行中持有的锁永不回收。
+cid_lock_idle_secs = 300
