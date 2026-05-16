@@ -81,6 +81,12 @@ impl HandlerState {
     }
 }
 
+/// Query-string fields WeChat attaches to every webhook hit.
+///
+/// `encrypt_type` (`aes` / `raw`) is intentionally NOT captured here —
+/// serde / axum's `Query` extractor silently drop unknown fields, and
+/// the encrypted-mode branch keys off the presence of `msg_signature`
+/// rather than `encrypt_type`. Dropping it keeps the struct lean.
 #[derive(Debug, serde::Deserialize)]
 pub struct WebhookQuery {
     signature: Option<String>,
@@ -88,9 +94,6 @@ pub struct WebhookQuery {
     nonce: Option<String>,
     echostr: Option<String>,
     msg_signature: Option<String>,
-    /// `aes` | `raw` (only present when WeChat is sending encrypted msgs).
-    #[serde(rename = "encrypt_type")]
-    _encrypt_type: Option<String>,
 }
 
 /// One-time URL verification.
@@ -347,10 +350,7 @@ fn check_replay(
     nonce: &str,
 ) -> std::result::Result<(), &'static str> {
     let ts_num: i64 = ts.parse().map_err(|_| "non-numeric timestamp")?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = crate::util::current_unix_secs();
     if (now - ts_num).abs() > REPLAY_WINDOW_SECS {
         return Err("timestamp outside ±300s window");
     }
@@ -439,11 +439,7 @@ fn wrap_encrypted_envelope(state: &HandlerState, inner_xml: &str) -> crate::erro
         .as_deref()
         .ok_or_else(|| crate::error::PluginError::EncryptFailed("aes key not loaded".into()))?;
     let encrypt = crypto::encrypt(inner_xml, aes_key, &cfg.wechat.app_id)?;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-        .to_string();
+    let ts = crate::util::current_unix_secs().to_string();
     let nonce = format!("{:016x}", rand::random::<u64>());
     let sig = signature::msg_signature(&cfg.wechat.token, &ts, &nonce, &encrypt);
     Ok(format!(
