@@ -527,6 +527,44 @@ fn store_reply(cache: &ReplyCache, msg_id: &str, reply: String) {
     }
 }
 
+impl HandlerState {
+    /// Background sweep: prune entries past their TTL from both the
+    /// reply-idempotency cache and the nonce-replay cache. Returns
+    /// `(reply_evicted, nonce_evicted)` for ops visibility.
+    ///
+    /// Both caches DO evict on every access during normal traffic; this
+    /// sweeper exists to handle the "burst then idle" pattern: a short
+    /// flood of 100K unique msg_ids leaves 100K entries occupying memory
+    /// until the NEXT request arrives — possibly hours later on a low-
+    /// traffic public account. The sweeper closes that window so memory
+    /// tracks active traffic, not historical peaks.
+    ///
+    /// Idempotent on contention: a poisoned mutex returns 0 for that
+    /// half and is treated as a no-op (it will be recovered on next
+    /// successful access).
+    pub fn gc_caches(&self) -> (usize, usize) {
+        let reply_evicted = match self.reply_cache.lock() {
+            Ok(mut map) => {
+                let cutoff = Instant::now() - REPLY_CACHE_TTL;
+                let before = map.len();
+                map.retain(|_, e| e.inserted_at > cutoff);
+                before - map.len()
+            }
+            Err(_) => 0,
+        };
+        let nonce_evicted = match self.nonce_cache.lock() {
+            Ok(mut map) => {
+                let cutoff = Instant::now() - Duration::from_secs(REPLAY_WINDOW_SECS as u64);
+                let before = map.len();
+                map.retain(|_, ts| *ts > cutoff);
+                before - map.len()
+            }
+            Err(_) => 0,
+        };
+        (reply_evicted, nonce_evicted)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
