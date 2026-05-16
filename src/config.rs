@@ -295,6 +295,13 @@ pub struct IntentDictCfg {
     pub action_words: Vec<String>,
     #[serde(default)]
     pub dates: Vec<TagWords>,
+    /// Country-level surface forms (e.g. `words=["土耳其","Turkey"]
+    /// tag="Turkey"`). Independent of `cities` — a user can mention
+    /// the country with no city ("土耳其有什么活动"), the city with
+    /// no country ("迪拜艺术展"), or both. The matcher fills whichever
+    /// dimensions appear and leaves the others as wildcards.
+    #[serde(default)]
+    pub countries: Vec<TagWords>,
     #[serde(default)]
     pub cities: Vec<TagWords>,
     #[serde(default)]
@@ -358,15 +365,18 @@ impl Default for RouterCfg {
 }
 
 fn default_router_help_text() -> String {
+    // Deliberately country / category agnostic. Operators almost
+    // always override this in their wechat.toml with concrete
+    // examples relevant to their deployment.
     "支持的问法:\n\
-     • 今天/明天/周末活动\n\
-     • <城市>活动 (如:迪拜活动)\n\
-     • <类别>活动 (如:艺术展、音乐演出)\n\
-     • 回复 help 看本菜单"
+     • 时间(今天 / 明天 / 周末)\n\
+     • 国家或城市(请在 wechat.toml 的 intent.dict 里配置)\n\
+     • 类别(艺术 / 音乐 / 美食 …)\n\
+     • 回复 help 查看本菜单"
         .into()
 }
 fn default_router_unknown_fallback() -> String {
-    "我没太理解 :( 请试试『今天活动』或『迪拜艺术』,或回复 help 查看菜单。".into()
+    "我没太理解 :( 请换个说法,或回复 help 查看菜单。".into()
 }
 fn default_router_empty_result_template() -> String {
     "最近 {days} 天没找到匹配的活动 :(".into()
@@ -404,10 +414,15 @@ pub struct NewsCardCfg {
     #[serde(default = "default_news_description_max_chars")]
     pub description_max_chars: usize,
     /// Substituted for `{city}` when the user didn't specify a city
-    /// filter. Common values: "UAE" / "全境" / "all of UAE" / etc.
-    /// Empty string is allowed (renders as just `{date}{count}…`).
-    #[serde(default = "default_news_default_city_label")]
+    /// filter. Empty string is allowed (renders as no prefix).
+    #[serde(default)]
     pub default_city_label: String,
+    /// Substituted for `{country}` when the user didn't specify a
+    /// country filter. Operators running multi-country digests can
+    /// use this to fill in a "Worldwide" / "全境" / "all regions"
+    /// label, or leave empty to suppress the placeholder entirely.
+    #[serde(default)]
+    pub default_country_label: String,
     /// Localized strings substituted for `{date}` per canonical
     /// `DateTag`. Each field is independent — leaving any empty
     /// makes that branch render as no prefix.
@@ -453,9 +468,6 @@ fn default_date_label_weekend() -> String {
 fn default_date_label_week() -> String {
     "本周".into()
 }
-fn default_news_default_city_label() -> String {
-    "UAE".into()
-}
 
 fn default_news_title_template() -> String {
     "{date}{city}有 {count} 场活动".into()
@@ -479,7 +491,11 @@ impl Default for NewsCardCfg {
             title_template: default_news_title_template(),
             description_separator: default_news_description_separator(),
             description_max_chars: default_news_description_max_chars(),
-            default_city_label: default_news_default_city_label(),
+            // Both scope labels default to empty — operators fill them
+            // to taste. A common single-country setup sets
+            // default_city_label="全境" and leaves default_country_label="".
+            default_city_label: String::new(),
+            default_country_label: String::new(),
             date_labels: DateLabelsCfg::default(),
         }
     }
@@ -577,6 +593,7 @@ impl Config {
             let dict_empty = self.intent.dict.help_words.is_empty()
                 && self.intent.dict.action_words.is_empty()
                 && self.intent.dict.dates.is_empty()
+                && self.intent.dict.countries.is_empty()
                 && self.intent.dict.cities.is_empty()
                 && self.intent.dict.categories.is_empty()
                 && self.intent.dict.times.is_empty();
@@ -590,6 +607,7 @@ impl Config {
             // Every TagWords entry must be non-trivial.
             for (section, list) in [
                 ("dates", &self.intent.dict.dates),
+                ("countries", &self.intent.dict.countries),
                 ("cities", &self.intent.dict.cities),
                 ("categories", &self.intent.dict.categories),
                 ("times", &self.intent.dict.times),

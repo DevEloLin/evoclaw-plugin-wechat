@@ -39,9 +39,12 @@ pub fn classify(user_msg: &str, dict: &IntentDictCfg) -> Option<Intent> {
     }
 
     // 3. Extract tags. Each dimension is independent; missing dimensions
-    //    stay `None` and are treated as wildcards downstream.
+    //    stay `None` and are treated as wildcards downstream. `country`
+    //    is matched separately from `city` so users can say either or
+    //    both ("土耳其活动" / "迪拜活动" / "土耳其伊斯坦布尔艺术展").
     let filter = EventFilter {
         date: pick_tag(&lower, &dict.dates).and_then(|t| parse_date_tag(&t)),
+        country: pick_tag(&lower, &dict.countries),
         city: pick_tag(&lower, &dict.cities),
         category: pick_tag(&lower, &dict.categories),
         time_of_day: pick_tag(&lower, &dict.times),
@@ -73,44 +76,53 @@ mod tests {
     use super::*;
     use crate::digest_cache::DateTag;
 
+    // Tag values used both in the dict and in assertions. Keeping
+    // them as constants makes "what is the canonical tag?" a single
+    // source of truth across the test module.
+    const TAG_TODAY: &str = "today";
+    const TAG_WEEKEND: &str = "weekend";
+    const TAG_COUNTRY_UAE: &str = "UAE";
+    const TAG_COUNTRY_TURKEY: &str = "Turkey";
+    const TAG_COUNTRY_NEPAL: &str = "Nepal";
+    const TAG_CITY_DUBAI: &str = "Dubai";
+    const TAG_CITY_ABU_DHABI: &str = "AbuDhabi";
+    const TAG_CITY_ISTANBUL: &str = "Istanbul";
+    const TAG_CITY_KATHMANDU: &str = "Kathmandu";
+    const TAG_CAT_ART: &str = "art";
+    const TAG_CAT_MUSIC: &str = "music";
+    const TAG_TIME_EVENING: &str = "evening";
+
+    fn tw(words: &[&str], tag: &str) -> TagWords {
+        TagWords {
+            words: words.iter().map(|s| (*s).into()).collect(),
+            tag: tag.into(),
+        }
+    }
+
     fn sample_dict() -> IntentDictCfg {
         IntentDictCfg {
             help_words: vec!["help".into(), "菜单".into(), "?".into()],
             action_words: vec!["活动".into(), "玩".into(), "event".into()],
             dates: vec![
-                TagWords {
-                    words: vec!["今天".into(), "today".into()],
-                    tag: "today".into(),
-                },
-                TagWords {
-                    words: vec!["周末".into(), "weekend".into()],
-                    tag: "weekend".into(),
-                },
+                tw(&["今天", "today"], TAG_TODAY),
+                tw(&["周末", "weekend"], TAG_WEEKEND),
+            ],
+            countries: vec![
+                tw(&["阿联酋", "UAE", "uae"], TAG_COUNTRY_UAE),
+                tw(&["土耳其", "Turkey", "turkey"], TAG_COUNTRY_TURKEY),
+                tw(&["尼泊尔", "Nepal", "nepal"], TAG_COUNTRY_NEPAL),
             ],
             cities: vec![
-                TagWords {
-                    words: vec!["迪拜".into(), "dubai".into()],
-                    tag: "Dubai".into(),
-                },
-                TagWords {
-                    words: vec!["阿布扎比".into(), "abudhabi".into()],
-                    tag: "AbuDhabi".into(),
-                },
+                tw(&["迪拜", "dubai"], TAG_CITY_DUBAI),
+                tw(&["阿布扎比", "abudhabi"], TAG_CITY_ABU_DHABI),
+                tw(&["伊斯坦布尔", "istanbul"], TAG_CITY_ISTANBUL),
+                tw(&["加德满都", "kathmandu"], TAG_CITY_KATHMANDU),
             ],
             categories: vec![
-                TagWords {
-                    words: vec!["艺术".into(), "art".into()],
-                    tag: "art".into(),
-                },
-                TagWords {
-                    words: vec!["音乐".into(), "music".into()],
-                    tag: "music".into(),
-                },
+                tw(&["艺术", "art"], TAG_CAT_ART),
+                tw(&["音乐", "music"], TAG_CAT_MUSIC),
             ],
-            times: vec![TagWords {
-                words: vec!["晚上".into(), "evening".into()],
-                tag: "evening".into(),
-            }],
+            times: vec![tw(&["晚上", "evening"], TAG_TIME_EVENING)],
         }
     }
 
@@ -145,16 +157,16 @@ mod tests {
         let r = classify("今天迪拜的艺术活动", &sample_dict()).unwrap();
         assert_eq!(r.kind, crate::intent::IntentKind::Events);
         assert_eq!(r.filter.date, Some(DateTag::Today));
-        assert_eq!(r.filter.city.as_deref(), Some("Dubai"));
-        assert_eq!(r.filter.category.as_deref(), Some("art"));
+        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_DUBAI));
+        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
     }
 
     #[test]
     fn weekend_music_in_abudhabi() {
         let r = classify("周末阿布扎比有什么音乐活动", &sample_dict()).unwrap();
         assert_eq!(r.filter.date, Some(DateTag::Weekend));
-        assert_eq!(r.filter.city.as_deref(), Some("AbuDhabi"));
-        assert_eq!(r.filter.category.as_deref(), Some("music"));
+        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_ABU_DHABI));
+        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_MUSIC));
     }
 
     #[test]
@@ -162,8 +174,38 @@ mod tests {
         let r = classify("Tonight Dubai 有 ART event 推荐吗", &sample_dict()).unwrap();
         // 'tonight' isn't in our dates dictionary, but 'art' / 'dubai' / 'event' are.
         assert_eq!(r.kind, crate::intent::IntentKind::Events);
-        assert_eq!(r.filter.city.as_deref(), Some("Dubai"));
-        assert_eq!(r.filter.category.as_deref(), Some("art"));
+        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_DUBAI));
+        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
+    }
+
+    #[test]
+    fn extracts_country_only_when_no_city_mentioned() {
+        let r = classify("土耳其有什么活动", &sample_dict()).unwrap();
+        assert_eq!(r.kind, crate::intent::IntentKind::Events);
+        assert_eq!(r.filter.country.as_deref(), Some(TAG_COUNTRY_TURKEY));
+        assert!(r.filter.city.is_none());
+    }
+
+    #[test]
+    fn extracts_country_and_city_when_both_mentioned() {
+        // 土耳其 + 伊斯坦布尔 → both dimensions populated. Query
+        // downstream will AND them — so events tagged country=Turkey
+        // AND city=Istanbul match. Events tagged only country=Turkey
+        // with no city will NOT match (intentional: user asked for
+        // a specific city).
+        let r = classify("土耳其伊斯坦布尔的艺术活动", &sample_dict()).unwrap();
+        assert_eq!(r.filter.country.as_deref(), Some(TAG_COUNTRY_TURKEY));
+        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_ISTANBUL));
+        assert_eq!(r.filter.category.as_deref(), Some(TAG_CAT_ART));
+    }
+
+    #[test]
+    fn nepal_kathmandu_extraction() {
+        // Different country to prove the matcher is genuinely
+        // config-driven, not biased toward UAE / Turkey.
+        let r = classify("尼泊尔加德满都有什么好玩的", &sample_dict()).unwrap();
+        assert_eq!(r.filter.country.as_deref(), Some(TAG_COUNTRY_NEPAL));
+        assert_eq!(r.filter.city.as_deref(), Some(TAG_CITY_KATHMANDU));
     }
 
     #[test]
