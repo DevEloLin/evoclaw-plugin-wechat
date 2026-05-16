@@ -14,6 +14,16 @@ When a fan DMs your public account, this plugin:
 
 No 微信认证 required, no 客服消息接口 used. Pure被动回复.
 
+## 📚 文档导航
+
+| 文档 | 给谁看 | 内容 |
+|---|---|---|
+| **[docs/USAGE.md](./docs/USAGE.md)** | 部署运维者 | 完整使用手册:从安装、配置、微信后台设置、nginx 反代、systemd 部署到调优、日志、故障排查 |
+| **[docs/DEVELOPING-PLUGINS.md](./docs/DEVELOPING-PLUGINS.md)** | 想做**其他**插件的开发者 | 完整开发指南:协议规范、参考实现讲解、step-by-step 新插件开发、安全 / 测试 / 多语言示例、可扩展插件清单 |
+
+简短回答:**你可以无限地为 EvoClaw 开发插件,完全不需要修改 EvoClaw 主仓的任何代码**。详见
+[DEVELOPING-PLUGINS.md](./docs/DEVELOPING-PLUGINS.md)。
+
 ## Why a separate binary
 
 EvoClaw already ships a `ChannelAdapter` extension point (see
