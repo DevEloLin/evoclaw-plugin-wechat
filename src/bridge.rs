@@ -275,11 +275,22 @@ impl Bridge {
     /// Send one inbound message and wait for the matching reply. The
     /// caller MUST wrap this in `tokio::time::timeout(...)` — otherwise a
     /// hung subprocess will block forever.
-    pub async fn ask(&self, openid: &str, text: &str) -> Result<String> {
+    ///
+    /// `conversation_id` MUST be stable per WeChat fan: it is the key
+    /// EvoClaw uses to load/save the per-user session jsonl. The earlier
+    /// "wx-{openid}-{unix_nanos}" scheme generated a fresh cid per
+    /// message, defeating multi-turn — that bug is fixed by making the
+    /// caller (handler) own cid construction.
+    pub async fn ask(&self, conversation_id: &str, openid: &str, text: &str) -> Result<String> {
         if !self.is_alive() {
             return Err(PluginError::Backend("bridge is dead".into()));
         }
-        let conv_id = format!("wx-{}-{}", openid, crate::util::current_unix_nanos());
+        // The bridge uses `conversation_id` purely as a routing key into
+        // its `pending` map. Two in-flight asks with the same cid would
+        // collide on the oneshot tx — but the per-cid ConvSerializer in
+        // HandlerState serializes those upstream, so by the time we reach
+        // here, only one ask is alive for a given cid. Use the cid as-is.
+        let route_key = conversation_id.to_string();
 
         let (tx, rx) = oneshot::channel();
         {
@@ -287,7 +298,7 @@ impl Bridge {
                 .pending
                 .lock()
                 .map_err(|_| PluginError::Backend("pending mutex poisoned".into()))?;
-            map.insert(conv_id.clone(), tx);
+            map.insert(route_key.clone(), tx);
         }
         // Drop-on-cancel cleanup: if `rx.await` is cancelled by the
         // caller's timeout, this guard's Drop removes the entry from
@@ -295,12 +306,12 @@ impl Bridge {
         // never-arriving reply, leaking memory under timeout pressure.
         let _guard = PendingGuard {
             pending: self.pending.clone(),
-            conv_id: conv_id.clone(),
+            conv_id: route_key.clone(),
         };
 
         let inbound = InboundMessage {
             channel: ChannelKind::wechat(),
-            conversation_id: &conv_id,
+            conversation_id: &route_key,
             sender_id: openid,
             sender_name: None,
             mentions_self: true,
@@ -590,7 +601,7 @@ mod tests {
         if b.is_alive() {
             return; // racy environment, skip
         }
-        let err = b.ask("oUser", "hi").await.unwrap_err();
+        let err = b.ask("wx-test-oUser", "oUser", "hi").await.unwrap_err();
         assert!(format!("{err}").contains("dead"));
     }
 

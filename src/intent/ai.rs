@@ -118,8 +118,15 @@ impl AiClassifier {
                 return Intent::unknown();
             }
         };
+        // Use a unique cid per classification so the (optional) session
+        // store doesn't accumulate stale "intent classifier history" —
+        // each classification call is conceptually independent. The
+        // EvoClaw side will create+leave a tiny per-call jsonl; the
+        // documented operations playbook trims `ic-*` files periodically.
+        let cid = format!("ic-{}", crate::util::current_unix_nanos());
         let result =
-            tokio::time::timeout(self.timeout, bridge.ask("intent-classifier", &prompt)).await;
+            tokio::time::timeout(self.timeout, bridge.ask(&cid, "intent-classifier", &prompt))
+                .await;
         let raw = match result {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {

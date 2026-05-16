@@ -73,6 +73,12 @@ pub struct HandlerState {
     reply_cache: ReplyCache,
     /// Recently-seen nonces. Used to reject replays of signed requests.
     nonce_cache: NonceCache,
+    /// Per-`conversation_id` mutex so two messages from the same WeChat
+    /// fan never reach the bridge concurrently. Required for the
+    /// session-jsonl model: same-cid concurrent writes would race, and
+    /// the bridge's `pending` map (keyed on cid) would route the second
+    /// reply to the wrong oneshot.
+    pub conv_serializer: Arc<crate::conv_serializer::ConvSerializer>,
 }
 
 impl HandlerState {
@@ -91,8 +97,41 @@ impl HandlerState {
             ai_classifier,
             reply_cache: Arc::new(StdMutex::new(HashMap::new())),
             nonce_cache: Arc::new(StdMutex::new(HashMap::new())),
+            conv_serializer: Arc::new(crate::conv_serializer::ConvSerializer::new()),
         }
     }
+}
+
+/// Build the stable per-fan `conversation_id`.
+///
+/// `app_id` distinguishes between Official Accounts when the plugin runs
+/// multiple in the future; `from_user` is the WeChat OpenID. The result
+/// is `wx-{app_id}-{sanitized(from_user)}` where sanitization replaces
+/// any character outside `[A-Za-z0-9_-]` with `_`. The EvoClaw side
+/// applies the same whitelist again (defence in depth), so a
+/// malformed cid never escapes the configured session dir.
+pub fn build_conversation_id(app_id: &str, from_user: &str) -> String {
+    fn sanitize(s: &str, out: &mut String) {
+        for c in s.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                out.push(c);
+            } else {
+                out.push('_');
+            }
+        }
+    }
+    let mut cid = String::with_capacity(4 + app_id.len() + from_user.len());
+    cid.push_str("wx-");
+    sanitize(app_id, &mut cid);
+    cid.push('-');
+    sanitize(from_user, &mut cid);
+    // Enforce a length cap matching EvoClaw's SessionStore MAX_CID_LEN
+    // so the file path stays within filesystem limits.
+    const MAX: usize = 128;
+    if cid.len() > MAX {
+        cid.truncate(MAX);
+    }
+    cid
 }
 
 /// Query-string fields WeChat attaches to every webhook hit.
@@ -247,7 +286,19 @@ async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: boo
             if user_msg.trim().is_empty() {
                 None
             } else {
-                Some(compute_text_payload(state, &from, &user_msg, inbound.msg_id.as_deref()).await)
+                // Stable per-fan cid: doubles as the SessionStore key on
+                // the EvoClaw side AND as the per-cid mutex key here.
+                let cid = build_conversation_id(&cfg.wechat.app_id, &from);
+                // Serialize same-cid concurrent messages: a fan rage-
+                // tapping "send" must not race two LLM turns against the
+                // same jsonl file. Different fans stay fully parallel
+                // (each cid has its own mutex).
+                let lock = state.conv_serializer.acquire(&cid);
+                let _guard = lock.lock_owned().await;
+                Some(
+                    compute_text_payload(state, &cid, &from, &user_msg, inbound.msg_id.as_deref())
+                        .await,
+                )
             }
         }
         "event" => match inbound.event.as_deref().unwrap_or("") {
@@ -314,6 +365,7 @@ async fn dispatch_and_reply(state: &HandlerState, xml: String, is_encrypted: boo
 /// (FromUserName, MsgId) tuple for retry idempotency.
 async fn compute_text_payload(
     state: &HandlerState,
+    cid: &str,
     from: &str,
     user_msg: &str,
     msg_id: Option<&str>,
@@ -345,7 +397,7 @@ async fn compute_text_payload(
         }
         crate::wechat::router::Reply::News(n) => ReplyPayload::News(n),
         crate::wechat::router::Reply::FallbackToLlm => {
-            let answer = ask_with_timeout(state, from, user_msg).await;
+            let answer = ask_with_timeout(state, cid, from, user_msg).await;
             ReplyPayload::Text(cap_reply_text(&answer, state.cfg.reply.max_chars))
         }
     };
@@ -374,7 +426,11 @@ async fn classify_intent(state: &HandlerState, user_msg: &str) -> crate::intent:
 
 /// Call the bridge with a hard timeout. On timeout, backend failure, or
 /// "no live bridges" from the pool, return the configured fallback.
-async fn ask_with_timeout(state: &HandlerState, openid: &str, text: &str) -> String {
+///
+/// `cid` is the stable per-fan conversation key (`wx-{app_id}-{from}`);
+/// it threads through to EvoClaw as `InboundMessage.conversation_id` and
+/// is the key under which the per-user jsonl session file is stored.
+async fn ask_with_timeout(state: &HandlerState, cid: &str, openid: &str, text: &str) -> String {
     let timeout = Duration::from_millis(state.cfg.evoclaw.timeout_ms);
     // Checkout itself can fail (every slot dead + respawn failures); fall
     // back gracefully instead of returning 500 to WeChat.
@@ -385,7 +441,7 @@ async fn ask_with_timeout(state: &HandlerState, openid: &str, text: &str) -> Str
             return state.cfg.reply.fallback.clone();
         }
     };
-    match tokio::time::timeout(timeout, bridge.ask(openid, text)).await {
+    match tokio::time::timeout(timeout, bridge.ask(cid, openid, text)).await {
         Ok(Ok(reply)) if !reply.trim().is_empty() => reply,
         Ok(Ok(_)) => {
             tracing::warn!("bridge returned empty reply, using fallback");

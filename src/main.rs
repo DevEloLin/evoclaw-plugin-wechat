@@ -6,6 +6,7 @@
 
 mod bridge;
 mod config;
+mod conv_serializer;
 mod digest_cache;
 mod error;
 mod intent;
@@ -173,11 +174,31 @@ async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
     tracing::info!(
         binary = %cfg.evoclaw.binary,
         workers = cfg.evoclaw.worker_count,
+        session_enabled = cfg.session.dir.is_some(),
         "spawning evoclaw subprocess pool"
     );
+    // Compose the effective extra_args: user-supplied first, then the
+    // session flags (if configured) appended. Session flags last so a
+    // user can't accidentally override them with an earlier --session-dir
+    // via extra_args (clap takes the LAST flag of a duplicated kind).
+    let mut effective_extra_args = cfg.evoclaw.extra_args.clone();
+    if let Some(dir) = &cfg.session.dir {
+        // Best-effort dir creation with restrictive perms. SessionStore on
+        // the EvoClaw side does the same — duplicate ensures the operator
+        // can see clearly which side failed if perms / FS errors crop up.
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| eyre::eyre!("create session.dir {}: {e}", dir.display()))?;
+        effective_extra_args.push("--session-dir".into());
+        effective_extra_args.push(dir.display().to_string());
+        effective_extra_args.push("--session-max-turns".into());
+        effective_extra_args.push(cfg.session.max_turns.to_string());
+        effective_extra_args.push("--session-ttl-days".into());
+        effective_extra_args.push(cfg.session.ttl_days.to_string());
+    }
     let pool = BridgePool::spawn(
         &cfg.evoclaw.binary,
-        &cfg.evoclaw.extra_args,
+        &effective_extra_args,
         cfg.evoclaw.worker_count,
         std::time::Duration::from_millis(cfg.evoclaw.startup_grace_ms),
     )
@@ -204,6 +225,32 @@ async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
     };
 
     let state = HandlerState::new(cfg.clone(), pool, aes_key, digest_cache, ai_classifier);
+
+    // Background GC for the per-cid mutex map. Even with millions of
+    // distinct users over the lifetime of the process, the map stays
+    // small (~current-active-fans size) because idle entries get
+    // evicted. We clamp gc_interval_secs to >=60 so a tiny misconfig
+    // can't make us busy-sweep.
+    if cfg.session.dir.is_some() {
+        let gc_serializer = state.conv_serializer.clone();
+        let gc_interval = std::time::Duration::from_secs(cfg.session.gc_interval_secs.max(60));
+        let gc_idle = std::time::Duration::from_secs(cfg.session.cid_lock_idle_secs);
+        tokio::spawn(async move {
+            // Use a tokio interval so we self-correct after long pauses
+            // (e.g. laptop sleep) instead of doing one sweep and dying.
+            let mut interval = tokio::time::interval(gc_interval);
+            // Skip the first immediate tick — process just started, map
+            // is empty. Without this we'd burn one log line at boot.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let evicted = gc_serializer.gc(gc_idle);
+                if evicted > 0 {
+                    tracing::debug!(evicted, "conv_serializer: gc swept idle cid locks");
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route(
