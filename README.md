@@ -18,7 +18,8 @@ No 微信认证 required, no 客服消息接口 used. Pure被动回复.
 
 | 文档 | 给谁看 | 内容 |
 |---|---|---|
-| **[docs/USAGE.md](./docs/USAGE.md)** | 部署运维者 | 完整使用手册:从安装、配置、微信后台设置、nginx 反代、systemd 部署到调优、日志、故障排查 |
+| **[docs/DEPLOY.md](./docs/DEPLOY.md)** | **第一次部署** 的运维 | 从零到生产的 11 步线性手册:机器准备 → 编译 → 配置 → 微信后台 → nginx HTTPS → systemd 长驻 → 端到端验证 → 日常运维 → 故障排查 + 完成清单 |
+| **[docs/USAGE.md](./docs/USAGE.md)** | 已部署后的运维 | 字段级配置参考、调优、多轮会话隔离机制、压测数据、已知限制 |
 | **[docs/DEVELOPING-PLUGINS.md](./docs/DEVELOPING-PLUGINS.md)** | 想做**其他**插件的开发者 | 完整开发指南:协议规范、参考实现讲解、step-by-step 新插件开发、安全 / 测试 / 多语言示例、可扩展插件清单 |
 
 简短回答:**你可以无限地为 EvoClaw 开发插件,完全不需要修改 EvoClaw 主仓的任何代码**。详见
