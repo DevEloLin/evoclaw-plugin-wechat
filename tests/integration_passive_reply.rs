@@ -17,7 +17,6 @@
 
 use assert_cmd::cargo::CommandCargoExt;
 use sha1::{Digest, Sha1};
-use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -473,10 +472,3 @@ async fn url_verification_get_echoes_back() {
     assert_eq!(body, echo);
 }
 
-/// Touch this to keep the writer used (avoids an unused-import lint when
-/// no test in this file directly uses `Write`).
-#[allow(dead_code)]
-fn _keep_write_in_use() -> std::io::Result<()> {
-    let mut sink = Vec::new();
-    sink.write_all(b"x")
-}

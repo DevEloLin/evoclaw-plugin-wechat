@@ -77,13 +77,19 @@ struct InboundMessage<'a> {
     received_at_ms: i64,
 }
 
+/// Decoded shape of the JSON lines EvoClaw writes back on stdout.
+///
+/// The upstream `OutboundMessage` envelope also has a `kind` field
+/// (`Reply` / `Notice` / `Error`) but we don't act on it — the plugin
+/// always renders the reply text into a passive-reply XML response and
+/// lets the channel layer decide what to do with non-`Reply` flavours
+/// in the future. Serde drops unknown JSON fields by default, so we
+/// don't need to enumerate `kind` here.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct OutboundMessage {
     conversation_id: String,
     text: String,
-    #[serde(rename = "kind")]
-    _kind: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,14 +289,7 @@ impl Bridge {
         if !self.is_alive() {
             return Err(PluginError::Backend("bridge is dead".into()));
         }
-        let conv_id = format!(
-            "wx-{}-{}",
-            openid,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
+        let conv_id = format!("wx-{}-{}", openid, crate::util::current_unix_nanos());
 
         let (tx, rx) = oneshot::channel();
         {
@@ -316,10 +315,7 @@ impl Bridge {
             sender_name: None,
             mentions_self: true,
             text,
-            received_at_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0),
+            received_at_ms: crate::util::current_unix_millis(),
         };
         let line = serde_json::to_string(&inbound)
             .map_err(|e| PluginError::Backend(format!("serialize inbound: {e}")))?;

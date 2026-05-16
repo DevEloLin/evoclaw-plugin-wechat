@@ -99,7 +99,7 @@ pub fn parse_inbound(xml: &str) -> Result<InboundXml> {
 /// Build an outbound passive-reply text envelope. `to_user` is the original
 /// `FromUserName`, `from_user` is the original `ToUserName` (gh_xxx).
 pub fn build_text_reply(to_user: &str, from_user: &str, content: &str) -> String {
-    let now = current_unix_seconds();
+    let now = crate::util::current_unix_secs();
     format!(
         "<xml>\
 <ToUserName><![CDATA[{}]]></ToUserName>\
@@ -129,13 +129,6 @@ fn decode_text(t: BytesText<'_>) -> Result<String> {
         .unescape()
         .map_err(|e| PluginError::BadXml(format!("text unescape: {e}")))?;
     Ok(cow.into_owned())
-}
-
-fn current_unix_seconds() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

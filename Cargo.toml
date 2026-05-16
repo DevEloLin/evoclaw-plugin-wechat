@@ -38,7 +38,6 @@ rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
-hex = "0.4"
 # Integration tests use a real HTTP client against the plugin's local
 # webhook. `reqwest` with rustls keeps the test feature-set small (no
 # OpenSSL system dep), `assert_cmd` lets us spawn the plugin binary.

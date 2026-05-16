@@ -7,6 +7,7 @@
 mod bridge;
 mod config;
 mod error;
+mod util;
 mod wechat;
 
 use crate::bridge::BridgePool;
@@ -21,6 +22,12 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 const DEFAULT_CONFIG_HINT: &str = "~/.evoclaw/plugins/wechat.toml";
+
+/// Cap on incoming POST bodies. Real WeChat passive-reply payloads are
+/// ~1 KB (small XML envelope). 64 KB is roughly 60× headroom — generous
+/// enough to absorb future WeChat protocol additions without obviously
+/// allowing abuse.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Parser)]
 #[command(name = "evoclaw-plugin-wechat", version, about = "WeChat Official Account passive-reply bridge for EvoClaw")]
@@ -169,8 +176,7 @@ async fn run_server(cfg: Arc<Config>) -> eyre::Result<()> {
             get(verify_url).post(handle_message),
         )
         .route("/healthz", get(|| async { "ok" }))
-        // WeChat POSTs are tiny (~1 KB). 64 KB caps any abuse.
-        .layer(RequestBodyLimitLayer::new(64 * 1024))
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

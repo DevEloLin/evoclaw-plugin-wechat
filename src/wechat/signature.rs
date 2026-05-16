@@ -16,19 +16,22 @@ use sha1::{Digest, Sha1};
 /// Compute the plain-mode signature: lexicographic sort of `[token, ts,
 /// nonce]`, concatenated, SHA1 hex.
 pub fn plain_signature(token: &str, timestamp: &str, nonce: &str) -> String {
-    let mut parts = [token, timestamp, nonce];
-    parts.sort_unstable();
-    let joined = parts.concat();
-    sha1_hex(joined.as_bytes())
+    signature_of(&mut [token, timestamp, nonce])
 }
 
 /// Compute the encrypted-mode `msg_signature`: sort of `[token, ts, nonce,
 /// encrypt]`, concatenated, SHA1 hex.
 pub fn msg_signature(token: &str, timestamp: &str, nonce: &str, encrypt: &str) -> String {
-    let mut parts = [token, timestamp, nonce, encrypt];
+    signature_of(&mut [token, timestamp, nonce, encrypt])
+}
+
+/// Shared core for both `plain_signature` (3 inputs) and `msg_signature`
+/// (4 inputs): lexicographically sort the parts, concatenate them, and
+/// take the SHA-1 hex digest. WeChat specifies the sort because the
+/// signer and the verifier do not share an ordering convention.
+fn signature_of(parts: &mut [&str]) -> String {
     parts.sort_unstable();
-    let joined = parts.concat();
-    sha1_hex(joined.as_bytes())
+    sha1_hex(parts.concat().as_bytes())
 }
 
 /// Constant-time signature comparison. WeChat signatures are lowercase
